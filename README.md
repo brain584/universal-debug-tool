@@ -49,7 +49,7 @@
   - `getBase`：使用 xDL（`xdl_iterate_phdr`）遍历目标进程已加载的 so，返回基址。
   - `hookfunc` / `removehook`：封装 DobbyHook，返回跳板地址与成功标志；脚本通过 FFI 将跳板转成函数指针以调用原函数。
   - `hookCPU`：封装 DobbyInstrument，回调中提供寄存器上下文（lightuserdata）与函数地址。
-  - `call`：经 `eglSwapBuffers` hook 把 Lua 闭包投递到目标主线程 / 渲染线程执行，解决跨线程调用问题。
+  - `call`：把 Lua 闭包排队到目标进程主线程执行，解决跨线程调用问题。泵的优先级为 `eglSwapBuffers`（渲染循环）→ `ALooper_pollOnce`（主线程 Looper）→ 独立兜底线程（每 20ms 刷新，适用于无渲染循环的进程）。
   - `read*` / `write*`：内存读写辅助函数。
 - hook 回调与脚本执行共用递归互斥锁，避免回调中再次执行 Lua 造成死锁。
 
@@ -64,6 +64,7 @@
 
 1. 新建子 GUI（如链接库窗口、内存修改窗口）会导致主 UI 闪现，关闭子窗口后主窗口位置可能被重置。
 2. 新建子 GUI 后系统触摸事件会被拦截，出现"只有 ImGui 可交互、系统界面触摸失灵"的问题（悬浮窗整体已做不触摸穿透处理，子窗口路径仍有该缺陷）。
+3. 断点堆栈结果可能不准，无法确定：目前只做 native 帧回溯（PC + LR），JNI 调用场景无法还原 Java 调用帧，且依赖目标函数的帧指针与寄存器状态，结果仅供参考。
 
 ## 可优化方向
 
