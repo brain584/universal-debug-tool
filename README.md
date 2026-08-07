@@ -74,7 +74,7 @@
 
 | 库 | 用途 | 改动情况 | 许可证 |
 | --- | --- | --- | --- |
-| [Qimgui](https://github.com/ohno1007/Qimgui) | Android 端 ImGui 悬浮窗基础 | **大改**：原为独立可执行文件，现改为 APK 内 SurfaceView 悬浮窗（JNI + EGL）；触摸改为 Java 层单窗口分发，实现"不触摸穿透"；UI 整体重写为调试工具界面；新增标题栏收起、防录屏、胶囊等 | 上游未明确标注（内部 ANativeWindowCreator.h 标 MIT，另含 AndroidSurfaceImgui-Enhanced（MIT）与 Google NDK Vulkan wrapper（Apache-2.0）），详见上游仓库 |
+| [Qimgui](https://github.com/ohno1007/Qimgui) | Android 端 ImGui 悬浮窗基础 | 修复了触摸穿透；修改了界面布局，UI 重写为调试工具界面 | 上游未明确标注（内部 ANativeWindowCreator.h 标 MIT，另含 AndroidSurfaceImgui-Enhanced（MIT）与 Google NDK Vulkan wrapper（Apache-2.0）），详见上游仓库 |
 | [imgui](https://github.com/ocornut/imgui) | GUI 渲染 | 预编译，核心未改动 | MIT |
 | [asmjit](https://github.com/asmjit/asmjit) | AArch64 汇编文本写入 | 未改源码，仅新增封装层（Disasm/AsmWrite.h）；CMake 只编译 core/support/arm 子集 | Zlib |
 | [capstone](https://github.com/capstone-engine/capstone) | 反汇编 | 未改源码 | BSD-3-Clause |
