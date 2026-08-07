@@ -91,6 +91,8 @@
 
 感谢以下开源项目及其作者：Qimgui、ImGui、asmjit、capstone、xDL、LuaJIT、Dobby、AndroidInject。
 
+特别感谢 Codex（OpenAI）在本项目开发过程中协助编写代码。
+
 ## 免责声明
 
 本人不一定会对该项目进行维护，如有需求者，请自行下载源码修改并编译。
