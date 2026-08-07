@@ -1364,6 +1364,7 @@ void DrawMemory() {
 namespace {
 std::mutex g_script_log_mutex;
 std::string g_script_log;
+std::atomic<size_t> g_script_log_from{SIZE_MAX};  // 已显示的日志水位（SIZE_MAX=未知）
 }
 
 void DrawScript() {
@@ -1381,10 +1382,17 @@ void DrawScript() {
         std::string script(script_code);
         std::thread([script] {
             std::string result = g_socket.SendCommand("lua " + script, 20000);
-            std::lock_guard<std::mutex> lk(g_script_log_mutex);
-            g_script_log += "> " + script + "\n" + result + "\n";
-            if (g_script_log.size() > 60000)
-                g_script_log.erase(0, g_script_log.size() - 60000);
+            {
+                std::lock_guard<std::mutex> lk(g_script_log_mutex);
+                g_script_log += "> " + script + "\n" + result + "\n";
+                if (g_script_log.size() > 60000)
+                    g_script_log.erase(0, g_script_log.size() - 60000);
+            }
+            // 同步刷新日志水位，避免轮询重复显示本次同步日志
+            std::string cnt = g_socket.SendCommand("lua_count", 2000);
+            size_t n = SIZE_MAX;
+            try { n = (size_t)std::stoull(cnt); } catch (...) {}
+            if (n != SIZE_MAX) g_script_log_from.store(n);
         }).detach();
     }
     ImGui::SameLine();
@@ -1397,6 +1405,40 @@ void DrawScript() {
     ImGui::TextDisabled(u8"需先连接 agent");
 
     ImGui::NextColumn();
+
+    // 轮询异步日志（call 闭包、hook 回调等产生），每 300ms 一次
+    {
+        static std::chrono::steady_clock::time_point g_last_log_poll{};
+        auto now_tp = std::chrono::steady_clock::now();
+        if (std::chrono::duration_cast<std::chrono::milliseconds>(now_tp - g_last_log_poll).count() >= 300) {
+            g_last_log_poll = now_tp;
+            if (g_socket.IsConnected()) {
+                if (g_script_log_from.load() == SIZE_MAX) {
+                    std::string cnt = g_socket.SendCommand("lua_count", 1500);
+                    size_t n = SIZE_MAX;
+                    try { n = (size_t)std::stoull(cnt); } catch (...) {}
+                    if (n != SIZE_MAX) g_script_log_from.store(n);
+                } else {
+                    std::string resp = g_socket.SendCommand(
+                        "lua_logs " + std::to_string(g_script_log_from.load()), 1500);
+                    if (resp.rfind("错误:", 0) != 0 && !resp.empty()) {
+                        size_t nl = resp.find('\n');
+                        if (nl != std::string::npos) {
+                            size_t n = SIZE_MAX;
+                            try { n = (size_t)std::stoull(resp.substr(0, nl)); } catch (...) {}
+                            if (n != SIZE_MAX) {
+                                std::lock_guard<std::mutex> lk(g_script_log_mutex);
+                                g_script_log += resp.substr(nl + 1);
+                                if (g_script_log.size() > 60000)
+                                    g_script_log.erase(0, g_script_log.size() - 60000);
+                                g_script_log_from.store(n);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     // 右：日志输出
     ImGui::SeparatorText(u8"日志");

@@ -279,6 +279,19 @@ std::string AgentHandleCommand(const std::string& cmd) {
         LuaEngine::Reset();
         return "lua engine reset ok";
     }
+    if (cmd == "lua_count") {
+        return std::to_string(LuaEngine::LogCount());
+    }
+    if (cmd.rfind("lua_logs ", 0) == 0) {
+        // 返回格式：第一行为当前日志总数（新水位），
+        // 其余行为 from 之后新增的日志。
+        size_t from = 0;
+        try { from = (size_t)std::stoull(cmd.substr(9)); } catch (...) { from = 0; }
+        std::vector<std::string> logs = LuaEngine::TakeLogsSince(from);
+        std::string out = std::to_string(LuaEngine::LogCount()) + "\n";
+        for (const auto& s : logs) out += s + "\n";
+        return out;
+    }
     if (cmd.rfind("lua ", 0) == 0) {
         return LuaEngine::RunScript(cmd.substr(4));
     }

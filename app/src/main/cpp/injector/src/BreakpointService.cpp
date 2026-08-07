@@ -79,15 +79,21 @@ constexpr uint32_t kPerfAttrSizeCompat = 120;
 constexpr uint64_t kSampleRegsMask = (1ULL << 33) - 1;
 constexpr int      kPcRegIndex     = 32;
 constexpr int      kSpRegIndex     = 31;
+constexpr int      kFpRegIndex     = 29;  // x29 = 帧指针
+constexpr int      kLrRegIndex     = 30;  // x30 = 链接寄存器
 #elif defined(__x86_64__)
 // perf 寄存器编号：ax..cx8、r8..r15、ip、flags -> 位 0..18。
 constexpr uint64_t kSampleRegsMask = (1ULL << 19) - 1;
 constexpr int      kPcRegIndex     = 8;
 constexpr int      kSpRegIndex     = 7;
+constexpr int      kFpRegIndex     = -1;
+constexpr int      kLrRegIndex     = -1;
 #else
 constexpr uint64_t kSampleRegsMask = 0;
 constexpr int      kPcRegIndex     = -1;
 constexpr int      kSpRegIndex     = -1;
+constexpr int      kFpRegIndex     = -1;
+constexpr int      kLrRegIndex     = -1;
 #endif
 
 // struct perf_event_attr（到 sig_data 共 128 字节）。
@@ -428,19 +434,28 @@ static const char* RegName(int i) {
     return "?";
 }
 
-// 从 sp 开始最多读取目标堆栈的 16 个 8 字节数据。服务
-// 以 root 运行，因此 /proc/<pid>/mem 可完全访问用户堆栈。
-static void ReadStack(uint64_t sp, std::vector<uint64_t>& out) {
+// 与主流调试工具一致：只输出 PC 与 LR（调用方返回地址）两条。
+// 注意断点命中在函数入口时 prologue 尚未执行，x29 仍是调用方
+// 的帧指针，沿帧指针链展开会得到错误的上层地址，因此这里
+// 不展开整条链，直接用 x30 寄存器作为调用方返回地址。
+static void ReadStack(uint64_t sp, uint64_t fp, uint64_t lr, uint64_t pc,
+                      std::vector<uint64_t>& out) {
+    (void)sp;  // sp 仅用于 GUI 展示堆栈起始地址
+    out.push_back(pc);  // 第一帧：断点处的 PC
+    if (lr >= 0x1000) {  // 第二帧：调用方返回地址
+        out.push_back(lr);
+        return;
+    }
+    // LR 无效时的兜底：从当前帧保存区读一次返回地址
+    if (fp < 0x1000 || (fp & 7) != 0) return;
     char path[64];
     snprintf(path, sizeof(path), "/proc/%d/mem", (int)g_target);
     int fd = open(path, O_RDONLY | O_CLOEXEC);
     if (fd < 0) return;
-    for (int i = 0; i < 16; ++i) {
-        uint64_t v = 0;
-        ssize_t n = pread(fd, &v, sizeof(v), (off_t)(sp + (uint64_t)i * 8));
-        if (n != (ssize_t)sizeof(v)) break;   // 堆栈页结束
-        out.push_back(v);
-    }
+    uint64_t saved_lr = 0;
+    if (pread(fd, &saved_lr, sizeof(saved_lr), (off_t)(fp + 8)) ==
+            (ssize_t)sizeof(saved_lr) && saved_lr >= 0x1000)
+        out.push_back(saved_lr);
     close(fd);
 }
 
@@ -450,8 +465,12 @@ static void EmitHit(const BpEvent& ev, uint32_t tid,
                       ? regs[kPcRegIndex] : 0;
     uint64_t sp = (kSpRegIndex >= 0 && kSpRegIndex < (int)regs.size())
                       ? regs[kSpRegIndex] : 0;
+    uint64_t fp = (kFpRegIndex >= 0 && kFpRegIndex < (int)regs.size())
+                      ? regs[kFpRegIndex] : 0;
+    uint64_t lr = (kLrRegIndex >= 0 && kLrRegIndex < (int)regs.size())
+                      ? regs[kLrRegIndex] : 0;
     std::vector<uint64_t> stack;
-    if (sp != 0) ReadStack(sp, stack);
+    ReadStack(sp, fp, lr, pc, stack);
 
     // 堆栈字段格式：stack=0x<sp>>0x[sp]>0x[sp+8]>...（imgui 侧
     // 把 '>' 分隔符渲染为 '→'，每个条目都可点击）。

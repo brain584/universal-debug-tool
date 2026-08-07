@@ -16,7 +16,8 @@
 //   hookfunc(addr, replaceAddr) -> DobbyHook（返回跳板与成功标志）
 //   removehook(addr)            -> DobbyDestroy 单个 hook
 //   remove_all_hook()           -> 销毁所有已安装的 hook
-//   call(function)              -> 稍后在进程主 / 渲染线程运行
+//   call(function)              -> 稍后在进程主 / 渲染线程运行（无渲染循环
+//                                  或 Looper 时回退到独立兜底线程）
 //   msleep(ms)
 //   readByte/readDword/readQword/readFloat/readDouble/readPtr/readBytes/readString
 //   writeByte/writeDword/writeQword/writeFloat/writeDouble/writePtr/writeBytes/writeString
@@ -31,7 +32,10 @@
 #include <set>
 #include <string>
 #include <sys/mman.h>
+#include <thread>
 #include <vector>
+#include <atomic>
+#include <chrono>
 #include <unistd.h>
 
 extern "C" {
@@ -114,6 +118,15 @@ inline std::map<std::string, uintptr_t> g_baseCache;
 inline std::mutex g_mainCallMutex;
 inline std::vector<int> g_mainCallRefs;
 
+// 首选泵（eglSwapBuffers / ALooper_pollOnce）最近一次动作时间，
+// 兜底线程据此判断首选泵是否还活着。
+inline std::atomic<uint64_t> g_lastPreferredPumpMs{0};
+
+inline uint64_t NowMs() {
+    return (uint64_t)std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
 inline void PushLog(const std::string& msg);
 inline void ProcessMainThreadTasks();
 
@@ -121,21 +134,89 @@ inline void ProcessMainThreadTasks();
 // 调用一次），在那里运行排队的 "call" 任务。
 typedef int (*EglSwapBuffers_t)(void*, void*);
 inline EglSwapBuffers_t g_origSwapBuffers = nullptr;
+inline void* g_mainPumpHooked = nullptr;  // 当前已安装的主线程泵 hook 地址
 
 inline int SwapBuffersHook(void* dpy, void* surface) {
     int ret = g_origSwapBuffers ? g_origSwapBuffers(dpy, surface) : 0;
     ProcessMainThreadTasks();
+    g_lastPreferredPumpMs.store(NowMs());
     return ret;
 }
 
-inline void InstallMainThreadHook() {
-    void* sym = DobbySymbolResolver("libEGL.so", "eglSwapBuffers");
-    if (!sym) return;
-    void* orig = nullptr;
-    if (DobbyHook(sym, (void*)SwapBuffersHook, &orig) == 0 && orig) {
-        g_origSwapBuffers = (EglSwapBuffers_t)orig;
-        PushLog("[Lua] 已挂载 eglSwapBuffers 主线程泵");
+// 备用泵 1：ALooper_pollOnce（libandroid.so）。目标进程没有 GLES 渲染
+// 循环，但主线程在 Looper 上轮询消息时会调用它。
+typedef int (*ALooper_pollOnce_t)(int timeoutMillis, int* outFd, int* outEvents, void** outData);
+inline ALooper_pollOnce_t g_origPollOnce = nullptr;
+
+inline int PollOnceHook(int timeoutMillis, int* outFd, int* outEvents, void** outData) {
+    // 先刷新排队的 call 任务，再进入本轮阻塞轮询，
+    // 避免 Looper 长时间空闲时任务迟迟不执行。
+    ProcessMainThreadTasks();
+    g_lastPreferredPumpMs.store(NowMs());
+    return g_origPollOnce(timeoutMillis, outFd, outEvents, outData);
+}
+
+// 兜底泵：独立线程定期刷新任务队列。无论首选泵（eglSwapBuffers /
+// ALooper_pollOnce）是否安装都会启动，保证 call 任务一定能被执行；
+// 仅当首选泵超过 300ms 没有动作且队列非空时才接管，避免抢走
+// 本应在主线程执行的任务。注意：兜底线程执行的任务不在目标主线程。
+inline std::thread g_fallbackPumpThread;
+inline std::atomic<bool> g_fallbackPumpRunning{false};
+
+inline bool HasPendingTasks() {
+    std::lock_guard<std::mutex> lk(g_mainCallMutex);
+    return !g_mainCallRefs.empty();
+}
+
+inline void FallbackPumpLoop() {
+    constexpr uint64_t kPreferredSilentMs = 300;  // 首选泵静默阈值
+    while (g_fallbackPumpRunning.load()) {
+        if (HasPendingTasks()) {
+            uint64_t now = NowMs();
+            if (now - g_lastPreferredPumpMs.load() >= kPreferredSilentMs)
+                ProcessMainThreadTasks();
+        }
+        usleep(20 * 1000);  // 每 20ms 刷新一次
     }
+}
+
+inline void StopFallbackPump() {
+    g_fallbackPumpRunning.store(false);
+    if (g_fallbackPumpThread.joinable()) g_fallbackPumpThread.join();
+}
+
+inline void InstallMainThreadHook() {
+    g_lastPreferredPumpMs.store(NowMs());
+
+    // 1. 优先：eglSwapBuffers（游戏渲染循环，每帧调用一次）
+    void* sym = DobbySymbolResolver("libEGL.so", "eglSwapBuffers");
+    if (sym) {
+        void* orig = nullptr;
+        if (DobbyHook(sym, (void*)SwapBuffersHook, &orig) == 0 && orig) {
+            g_origSwapBuffers = (EglSwapBuffers_t)orig;
+            g_mainPumpHooked = sym;
+        }
+    }
+    // 2. 其次：ALooper_pollOnce（主线程 Looper 消息循环）
+    if (!g_mainPumpHooked) {
+        sym = DobbySymbolResolver("libandroid.so", "ALooper_pollOnce");
+        if (sym) {
+            void* orig = nullptr;
+            if (DobbyHook(sym, (void*)PollOnceHook, &orig) == 0 && orig) {
+                g_origPollOnce = (ALooper_pollOnce_t)orig;
+                g_mainPumpHooked = sym;
+            }
+        }
+    }
+    // 3. 兜底线程：始终启动，保证 call 任务不会被卡死
+    g_fallbackPumpRunning.store(true);
+    g_fallbackPumpThread = std::thread(FallbackPumpLoop);
+    g_fallbackPumpThread.detach();
+
+    if (g_mainPumpHooked)
+        PushLog("[Lua] 主线程泵已安装，兜底线程就绪");
+    else
+        PushLog("[Lua] 主线程泵: 兜底线程（非目标主线程）");
 }
 
 // ---------- 日志 ----------
@@ -148,6 +229,12 @@ inline std::vector<std::string> TakeLogsSince(size_t from) {
     std::lock_guard<std::mutex> lock(g_logMutex);
     if (from >= g_logMessages.size()) return {};
     return std::vector<std::string>(g_logMessages.begin() + from, g_logMessages.end());
+}
+
+// 当前日志总数（GUI 轮询日志水位用）
+inline size_t LogCount() {
+    std::lock_guard<std::mutex> lock(g_logMutex);
+    return g_logMessages.size();
 }
 
 // ---------- Dobby instrument 回调 ----------
@@ -473,11 +560,6 @@ inline std::string RunScript(const std::string& script) {
     if (!L) return "[Lua] 引擎未初始化";
 
     std::lock_guard<std::recursive_mutex> lock(g_luaMutex);
-    size_t log_from = 0;
-    {
-        std::lock_guard<std::mutex> lk(g_logMutex);
-        log_from = g_logMessages.size();
-    }
 
     std::string code = script;
     ReplaceAll(code, u8"\u201C", "\"");  // "
@@ -513,11 +595,11 @@ inline std::string RunScript(const std::string& script) {
         lua_pop(L, 1);
     }
 
-    std::vector<std::string> logs = TakeLogsSince(log_from);
+    // 日志统一由 GUI 轮询 lua_logs 获取（含 call 闭包等异步输出），
+    // 这里只返回成功 / 错误标记，避免与轮询结果重复。
     std::string out;
-    for (const auto& s : logs) out += s + "\n";
-    if (!err.empty()) out += "[Lua 错误] " + err + "\n";
-    if (rc == LUA_OK && logs.empty()) out += "[Lua] 执行成功\n";
+    if (!err.empty()) out = "[Lua 错误] " + err + "\n";
+    else if (rc == LUA_OK) out = "[Lua] 执行成功\n";
     return out;
 }
 
@@ -589,6 +671,15 @@ inline void Init() {
 
 // ---------- 重置 ----------
 inline void Reset() {
+    // 停止兜底泵，避免它继续访问即将销毁的 Lua 状态
+    StopFallbackPump();
+    // 卸载主线程泵 hook，避免 Init 时重复安装
+    if (g_mainPumpHooked) {
+        DobbyDestroy(g_mainPumpHooked);
+        g_mainPumpHooked = nullptr;
+        g_origSwapBuffers = nullptr;
+        g_origPollOnce = nullptr;
+    }
     std::lock_guard<std::recursive_mutex> lock(g_luaMutex);
     for (uintptr_t addr : g_hookAddrs) DobbyDestroy((void*)addr);
     g_hookAddrs.clear();
