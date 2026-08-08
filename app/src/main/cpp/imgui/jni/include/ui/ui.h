@@ -10,11 +10,6 @@ namespace aimgui {
 struct UiState {
     const char* renderer_name = nullptr;
 
-    // 防录制：Surface 以 skipScreenshot 标志创建，
-    // 这样它不会出现在截屏 / 录屏中。
-    bool permeate_record         = false;
-    bool request_permeate_toggle = false;
-
     // 帧率上限。0 = 垂直同步（跟随面板刷新）。
     int target_fps = 0;
 

@@ -1472,13 +1472,6 @@ void DrawSettings(UiState* state) {
     ImGui::Spacing();
     ImGui::SeparatorText(u8"显示");
 
-    // 防录屏开关
-    bool perm = state->permeate_record;
-    if (ImGui::Checkbox(u8"防录屏（对录制/投屏隐藏）", &perm)) {
-        state->request_permeate_toggle = true;
-    }
-    ImGui::TextDisabled(u8"状态: %s", state->permeate_record ? u8"已开启" : u8"已关闭");
-
     // 辉光强度
     ImGui::Spacing();
     SliderFloatGrabValue(u8"辉光强度", &state->bloom_intensity, 0.0f, 2.5f, "%.2f");

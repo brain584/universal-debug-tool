@@ -71,7 +71,7 @@ int main() {
     g_UiState = &st; // 【新增】绑定全局指针提供给触控模块运算
 
     aimgui::WindowSession ws;
-    if (!ws.Build(W, st.permeate_record)) { ImGui::DestroyContext(); return 1; }
+    if (!ws.Build(W, false)) { ImGui::DestroyContext(); return 1; }
     st.renderer_name = ws.renderer()->Name();
     
     // 【关键修复】确保此处为 false 以启用设备的独占读取模式 (uinput转发)
@@ -93,7 +93,6 @@ int main() {
         st.display_w = info.width; st.display_h = info.height;
         if (info.orientation != orient) { orient = info.orientation; Touch::setOrientation((int)orient); }
         if (aimgui::kbd_input::ConsumeVolumePresses() > 0) st.collapsed = !st.collapsed;
-        if (!st.permeate_record) ANativeWindowCreator::ProcessMirrorDisplay();
         aimgui::kbd_input::Flush();
 
         ws.renderer()->NewFrame();
@@ -104,14 +103,6 @@ int main() {
         ws.renderer()->SetSnapshotFrozen(st.exit_anim_active);
         ws.renderer()->EndFrame();
         pacer.Wait();
-
-        if (st.request_permeate_toggle) {
-            st.request_permeate_toggle = false;
-            st.permeate_record = !st.permeate_record;
-            ws.Destroy();
-            if (!ws.Build(W, st.permeate_record)) { running = false; break; }
-            st.renderer_name = ws.renderer()->Name();
-        }
     }
     aimgui::kbd_input::Shutdown();
     ws.Destroy();
