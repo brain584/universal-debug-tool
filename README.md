@@ -1,6 +1,6 @@
 # Universal Debug Tool（通用动态调试工具）
 
-面向 **ARM64 Android** 的本地动态调试工具：在不挂起目标进程的前提下，实现函数插桩、硬件断点、主动调用与实时内存读写、搜索、修改。整个工具被打包成一个 Android APK，注入与调试能力依赖设备 root。
+面向 **ARM64 Android** 的本地动态调试工具：运行期调试（函数插桩、硬件断点、主动调用、内存读写、搜索、修改）不挂起目标进程；注入阶段通过 ptrace 会短暂挂起目标进程，注入完成后恢复。整个工具被打包成一个 Android APK，注入与调试能力依赖设备 root。
 
 ## 功能概览
 
@@ -49,7 +49,7 @@
   - `getBase`：使用 xDL（`xdl_iterate_phdr`）遍历目标进程已加载的 so，返回基址。
   - `hookfunc` / `removehook`：封装 DobbyHook，返回跳板地址与成功标志；脚本通过 FFI 将跳板转成函数指针以调用原函数。
   - `hookCPU`：封装 DobbyInstrument，回调中提供寄存器上下文（lightuserdata）与函数地址。
-  - `call`：把 Lua 闭包排队到目标进程主线程执行，解决跨线程调用问题。泵的优先级为 `eglSwapBuffers`（渲染循环）→ `ALooper_pollOnce`（主线程 Looper）→ 独立兜底线程（每 20ms 刷新，适用于无渲染循环的进程）。
+  - `call`：把 Lua 闭包排队执行，优先在目标进程主线程（泵为 `eglSwapBuffers` 渲染循环或 `ALooper_pollOnce` 主线程 Looper）；若均不可用，则由独立兜底线程执行（每 20ms 刷新，此时不在目标主线程）。
   - `read*` / `write*`：内存读写辅助函数。
 - hook 回调与脚本执行共用递归互斥锁，避免回调中再次执行 Lua 造成死锁。
 
