@@ -31,12 +31,15 @@
 #include "MemToolTypes.h"
 
 #include <limits>
+#include <cerrno>
+#include <csignal>
 
 // 由 native-lib.cpp 提供：在 `su` 下运行独立注入器并
 // 返回捕获的输出。
 extern std::string RunInjector(const std::string& pkg);
 // 由 native-lib.cpp 提供：内存查看器使用的 root 内存辅助函数。
 extern std::string RunSuCommand(const std::string& cmd);
+extern std::string GetConfigFilePath();
 extern std::string ReadRemoteMaps(int pid);
 extern bool ReadRemoteDword(int pid, uintptr_t addr, uint32_t& out);
 extern bool WriteRemoteDword(int pid, uintptr_t addr, uint32_t value);
@@ -47,6 +50,11 @@ extern bool ReadRemotePages(int pid, const std::vector<uintptr_t>& pages,
 extern bool CopyToClipboard(const std::string& text);
 
 namespace aimgui {
+
+// 目标进程存活监控（实现位于文件末尾，进程选择处需要调用）。
+static void BindTargetAlive(int pid);
+// 内存类型配置持久化（实现位于文件末尾，页面勾选变化处调用）。
+static void SaveMemTypeConfig();
 
 // ─── 侧边栏条目 ─────────────────────────────────────────────────────────
 const PageItem kPages[] = {
@@ -115,6 +123,16 @@ static const char* kMemTypes[] = {
 static const int kMemTypeCount = (int)(sizeof(kMemTypes) / sizeof(kMemTypes[0]));
 static bool g_mem_type_show[kMemTypeCount];
 
+// 内存类型索引 -> 搜索用 RANGE_* 标志。内存页与搜索页共享
+// g_mem_type_show 这份勾选状态；搜索时按此表换算成引擎掩码。
+static const uint32_t kMemTypeFlags[kMemTypeCount] = {
+    RANGE_CODE_APP,  RANGE_CODE_SYSTEM, RANGE_JAVA_HEAP, RANGE_C_HEAP,
+    RANGE_C_ALLOC,   RANGE_C_DATA,
+    RANGE_C_HEAP | RANGE_C_ALLOC | RANGE_C_DATA | RANGE_C_BSS,  // "cpp"（兜底）
+    RANGE_C_BSS,     RANGE_ANONYMOUS,   RANGE_STACK,    RANGE_ASHMEM,
+    RANGE_VIDEO,     RANGE_JAVA,        (uint32_t)RANGE_OTHER
+};
+
 // 连续模式（4 字节步进，与区域列表相同的行格式）
 static bool              g_mem_cont_mode = false;
 static uintptr_t         g_mem_cont_base = 0;
@@ -182,19 +200,6 @@ static std::atomic<bool> g_search_running{false};
 static std::string       g_search_status;      // 由 g_search_mutex 保护
 static int               g_search_page = 0;    // 由 g_search_mutex 保护
 static uint64_t          g_search_hits_version = 0;  // 由互斥锁保护
-static const int kSearchAreaIds[] = {
-    RANGE_ALL, RANGE_JAVA_HEAP, RANGE_C_HEAP, RANGE_C_ALLOC,
-    RANGE_C_DATA, RANGE_C_BSS, RANGE_ANONYMOUS, RANGE_JAVA,
-    RANGE_STACK, RANGE_ASHMEM, RANGE_VIDEO, RANGE_OTHER,
-    RANGE_B_BAD, RANGE_CODE_APP, RANGE_CODE_SYSTEM};
-static const int kSearchAreaCount =
-    (int)(sizeof(kSearchAreaIds) / sizeof(kSearchAreaIds[0]));
-static const char* kSearchAreaNames[] = {
-    "所有 [ALL]", "Java堆 [Jh]", "C堆 [Ch]", "C分配 [Ca]",
-    "C数据 [Cd]", "C未初始化 [Cb]", "匿名 [A]", "Java [J]",
-    "栈 [S]", "Ashmem [As]", "视频 [V]", "其他 [O]",
-    "错误 [B]", "代码应用 [Xa]", "代码系统 [Xs]"};
-static bool g_search_area_show[kSearchAreaCount];
 static constexpr int     kSearchPageSize = 8;
 static constexpr size_t  kSearchMaxExact = 5000;
 static constexpr size_t  kSearchMaxFuzzy = 1000000;
@@ -677,6 +682,7 @@ void DrawSelectProcess(UiState* state) {
             g_mem_pid.store(p.pid);
             g_mem_loaded.store(false);
             g_mem_loading.store(false);
+            BindTargetAlive(p.pid);
         }
     }
     ImGui::EndChild();
@@ -776,7 +782,11 @@ static void MemLoadCont(int pid) {
                   [](const MemRegion& a, const MemRegion& b) { return a.start < b.start; });
 
         bool show[kMemTypeCount];
-        for (int i = 0; i < kMemTypeCount; ++i) show[i] = g_mem_type_show[i];
+        bool anyType = false;
+        for (int i = 0; i < kMemTypeCount; ++i) {
+            show[i] = g_mem_type_show[i];
+            if (show[i]) anyType = true;
+        }
 
         uintptr_t base = g_mem_cont_base;
         uintptr_t addrs[kMemPageSize] = {0};
@@ -796,7 +806,7 @@ static void MemLoadCont(int pid) {
             // 而不是悄悄隐藏内存。
             if (ti < 0) ti = kMemTypeCount - 1;
             type[i] = ti;
-            shown[i] = show[ti];
+            shown[i] = !anyType || show[ti];
             uint8_t b[16];
             ok[i] = ReadRemoteBytes(pid, addr, b, sizeof(b));
             if (ok[i]) {
@@ -1155,26 +1165,30 @@ void DrawMemory() {
 
     // 类型筛选 + 数值类型
     {
-        static bool filter_init = false;
-        if (!filter_init) {
-            for (int i = 0; i < kMemTypeCount; ++i) g_mem_type_show[i] = true;
-            g_mem_filter_dirty = true;  // 触发首次数值加载
-            filter_init = true;
-        }
-
         bool anyFilterChanged = false;
-        if (ImGui::CollapsingHeader(u8"类型筛选", ImGuiTreeNodeFlags_DefaultOpen)) {
+        if (ImGui::CollapsingHeader(u8"类型筛选（未勾选 = 全部）",
+                                    ImGuiTreeNodeFlags_DefaultOpen)) {
             ImGui::Columns(3, "memtypecols", false);
             for (int i = 0; i < kMemTypeCount; ++i) {
                 if (ImGui::Checkbox(kMemTypes[i], &g_mem_type_show[i])) anyFilterChanged = true;
                 ImGui::NextColumn();
             }
             ImGui::Columns(1);
+            if (ImGui::Button(u8"全选")) {
+                for (int i = 0; i < kMemTypeCount; ++i) g_mem_type_show[i] = true;
+                anyFilterChanged = true;
+            }
+            ImGui::SameLine();
+            if (ImGui::Button(u8"全不选")) {
+                for (int i = 0; i < kMemTypeCount; ++i) g_mem_type_show[i] = false;
+                anyFilterChanged = true;
+            }
         }
         if (anyFilterChanged) {
             g_mem_filter_dirty = true;
             g_mem_page = 0;
             if (g_mem_cont_mode) MemLoadCont(pid);
+            SaveMemTypeConfig();
         }
 
         ImGui::SeparatorText(u8"数值类型");
@@ -1260,13 +1274,17 @@ void DrawMemory() {
         return;
     }
 
+    bool anyType = false;
+    for (int k = 0; k < kMemTypeCount; ++k)
+        if (g_mem_type_show[k]) { anyType = true; break; }
+
     std::vector<int> filtered;
     for (int i = 0; i < (int)regions.size(); ++i) {
         int ti = kMemTypeCount - 1;
         for (int k = 0; k < kMemTypeCount; ++k) {
             if (regions[i].type == kMemTypes[k]) { ti = k; break; }
         }
-        if (g_mem_type_show[ti]) filtered.push_back(i);
+        if (!anyType || g_mem_type_show[ti]) filtered.push_back(i);
     }
     if (filtered.empty()) {
         ImGui::TextDisabled(u8"当前筛选下没有内存段");
@@ -2491,30 +2509,27 @@ static void DrawSearch() {
     ImGui::SeparatorText(u8"内存搜索");
     ImGui::TextDisabled(u8"范围格式: 10~20");
 
-    // 内存类型：多选
-    static bool areaInit = false;
-    if (!areaInit) {
-        for (int i = 0; i < kSearchAreaCount; ++i)
-            g_search_area_show[i] = true;
-        areaInit = true;
-    }
-    if (ImGui::CollapsingHeader(u8"内存类型（多选）",
+    // 内存类型：多选（与内存页共享勾选状态，未勾选 = 全部）
+    if (ImGui::CollapsingHeader(u8"内存类型（多选，未勾选 = 全部）",
                                 ImGuiTreeNodeFlags_DefaultOpen)) {
+        bool anyChanged = false;
         ImGui::Columns(3, "searchareacols", false);
-        for (int i = 0; i < kSearchAreaCount; ++i) {
-            ImGui::Checkbox(kSearchAreaNames[i], &g_search_area_show[i]);
+        for (int i = 0; i < kMemTypeCount; ++i) {
+            if (ImGui::Checkbox(kMemTypes[i], &g_mem_type_show[i]))
+                anyChanged = true;
             ImGui::NextColumn();
         }
         ImGui::Columns(1);
         if (ImGui::Button(u8"全选")) {
-            for (int i = 0; i < kSearchAreaCount; ++i)
-                g_search_area_show[i] = true;
+            for (int i = 0; i < kMemTypeCount; ++i) g_mem_type_show[i] = true;
+            anyChanged = true;
         }
         ImGui::SameLine();
         if (ImGui::Button(u8"全不选")) {
-            for (int i = 0; i < kSearchAreaCount; ++i)
-                g_search_area_show[i] = false;
+            for (int i = 0; i < kMemTypeCount; ++i) g_mem_type_show[i] = false;
+            anyChanged = true;
         }
+        if (anyChanged) SaveMemTypeConfig();
     }
 
     static const int kTypeIds[] = {
@@ -2542,14 +2557,12 @@ static void DrawSearch() {
         ImGui::SameLine();
         if (ImGui::Button(u8"搜索") && !busy) {
             std::vector<int> sel;
-            for (int i = 0; i < kSearchAreaCount; ++i)
-                if (g_search_area_show[i]) sel.push_back(kSearchAreaIds[i]);
-            if (sel.empty()) {
-                std::lock_guard<std::mutex> lk(g_search_mutex);
-                g_search_status = u8"请至少勾选一个内存类型";
-            } else {
-                SearchExactRun(pid, sel, g_search_type, g_search_value);
-            }
+            for (int i = 0; i < kMemTypeCount; ++i)
+                if (g_mem_type_show[i]) sel.push_back((int)kMemTypeFlags[i]);
+            if (sel.empty())  // 未勾选 = 全部内存类型
+                for (int i = 0; i < kMemTypeCount; ++i)
+                    sel.push_back((int)kMemTypeFlags[i]);
+            SearchExactRun(pid, sel, g_search_type, g_search_value);
         }
         ImGui::SameLine();
         if (ImGui::Button(u8"改善") && !busy)
@@ -2557,14 +2570,12 @@ static void DrawSearch() {
     } else {
         if (ImGui::Button(u8"初始化模糊搜索") && !busy) {
             std::vector<int> sel;
-            for (int i = 0; i < kSearchAreaCount; ++i)
-                if (g_search_area_show[i]) sel.push_back(kSearchAreaIds[i]);
-            if (sel.empty()) {
-                std::lock_guard<std::mutex> lk(g_search_mutex);
-                g_search_status = u8"请至少勾选一个内存类型";
-            } else {
-                SearchFuzzyInit(pid, sel, g_search_type);
-            }
+            for (int i = 0; i < kMemTypeCount; ++i)
+                if (g_mem_type_show[i]) sel.push_back((int)kMemTypeFlags[i]);
+            if (sel.empty())  // 未勾选 = 全部内存类型
+                for (int i = 0; i < kMemTypeCount; ++i)
+                    sel.push_back((int)kMemTypeFlags[i]);
+            SearchFuzzyInit(pid, sel, g_search_type);
         }
         ImGui::SameLine();
         if (ImGui::Button(u8"未变化") && !busy)
@@ -2734,6 +2745,167 @@ void DrawPage(UiState* state, Page page) {
     SetOverlayExpanded((page == Page::Search || page == Page::Memory ||
                         page == Page::Breakpoint || page == Page::Save) &&
                        (g_lib_open || g_edit_open));
+}
+
+// ── 目标进程存活监控 ─────────────────────────────────────────────
+// 目标进程销毁后自动清空断点结果、保存地址、搜索结果等状态。
+// GUI 进程非 root：pidfd / 直接读 /proc/<pid>/stat 对其它 App 都会
+// 被 SELinux 拒绝，因此存在性检查用 kill(pid, 0)（ESRCH = 不存在，
+// EPERM = 存在但无权限）；starttime 防 PID 复用则通过 su 读取并低频复核。
+static int      g_alive_pid = 0;
+static uint64_t g_alive_starttime = 0;   // /proc/<pid>/stat 第 22 字段（su 读取）
+static int      g_alive_check_count = 0; // 每 5 次检查做一次 su 复核
+static std::chrono::steady_clock::time_point g_alive_last_check{};
+
+// 从 stat 文本解析进程状态（第 3 字段）与 starttime（第 22 字段）。
+// comm 可能含空格 / 括号，先做括号配对跳过。
+static bool ParseStatText(const std::string& text, uint64_t& starttime,
+                          bool& zombie) {
+    starttime = 0;
+    zombie = false;
+    size_t lp = text.find('(');
+    if (lp == std::string::npos) return false;
+    size_t depth = 0;
+    size_t rp = std::string::npos;
+    for (size_t i = lp; i < text.size(); ++i) {
+        if (text[i] == '(') depth++;
+        else if (text[i] == ')') {
+            depth--;
+            if (depth == 0) { rp = i; break; }
+        }
+    }
+    if (rp == std::string::npos) return false;
+
+    std::istringstream iss(text.substr(rp + 1));
+    std::string state;
+    if (!(iss >> state) || state.empty()) return false;
+    zombie = (state[0] == 'Z');
+    std::string tok;
+    for (int i = 0; i < 18; ++i)  // 跳过第 4..21 字段
+        if (!(iss >> tok)) return false;
+    unsigned long long st = 0;
+    if (!(iss >> st)) return false;
+    starttime = (uint64_t)st;
+    return true;
+}
+
+// 绑定目标：通过 su 记录 starttime 快照。
+static void BindTargetAlive(int pid) {
+    g_alive_pid = pid;
+    g_alive_starttime = 0;
+    g_alive_check_count = 0;
+    char cmd[64];
+    snprintf(cmd, sizeof(cmd), "cat /proc/%d/stat", pid);
+    std::string txt = RunSuCommand(cmd);
+    uint64_t st = 0;
+    bool z = false;
+    if (!txt.empty() && ParseStatText(txt, st, z)) g_alive_starttime = st;
+    g_alive_last_check = std::chrono::steady_clock::now();
+}
+
+static bool TargetProcessAlive() {
+    if (g_alive_pid <= 0) return true;
+    // 存在性检查：非 root 也能用 kill(pid, 0) 区分不存在（ESRCH）
+    // 与存在但无权限（EPERM）。
+    if (kill(g_alive_pid, 0) != 0 && errno == ESRCH) return false;
+    // 周期性（每 5 次检查）通过 su 复核 starttime，防 PID 复用
+    if (++g_alive_check_count >= 5) {
+        g_alive_check_count = 0;
+        if (g_alive_starttime != 0) {
+            char cmd[64];
+            snprintf(cmd, sizeof(cmd), "cat /proc/%d/stat", g_alive_pid);
+            std::string txt = RunSuCommand(cmd);
+            uint64_t st = 0;
+            bool z = false;
+            if (txt.empty() || !ParseStatText(txt, st, z)) {
+                // su 读取失败（瞬时故障）保守按存活处理，交给 kill 判定
+                return true;
+            }
+            if (z || st != g_alive_starttime) return false;  // 僵尸 / PID 复用
+        }
+    }
+    return true;
+}
+
+// 目标进程销毁：清空与目标相关的全部状态。
+static void ResetTargetState() {
+    g_bp.Stop();
+    g_bp.ClearHits();
+    {
+        std::lock_guard<std::mutex> lk(g_saved_mutex);
+        g_saved_rows.clear();
+    }
+    g_saved_dirty.store(true);
+    {
+        std::lock_guard<std::mutex> lk(g_search_mutex);
+        g_search_hits.clear();
+        g_search_page = 0;
+        g_search_status = u8"目标进程已退出，相关状态已自动重置";
+        g_search_hits_version++;
+    }
+    {
+        std::lock_guard<std::mutex> lk(g_mem_mutex);
+        g_mem_regions.clear();
+    }
+    g_mem_loaded.store(false);
+    g_mem_loading.store(false);
+    g_mem_page = 0;
+    g_mem_cont_count = 0;
+    {
+        std::lock_guard<std::mutex> lk(g_lib_mutex);
+        g_lib_list.clear();
+    }
+    g_lib_fetching.store(false);
+    g_mem_pid.store(0);
+    g_alive_pid = 0;
+    g_alive_starttime = 0;
+    g_alive_check_count = 0;
+}
+
+void CheckTargetAlive() {
+    auto now = std::chrono::steady_clock::now();
+    if (std::chrono::duration_cast<std::chrono::milliseconds>(
+            now - g_alive_last_check).count() < 1000)
+        return;
+    g_alive_last_check = now;
+    if (g_alive_pid <= 0) return;
+    if (!TargetProcessAlive()) ResetTargetState();
+}
+
+// ── 内存类型配置持久化 ────────────────────────────────────────────
+// 把内存页 / 搜索页共享的内存类型勾选状态保存到 App 私有 files 目录，
+// 启动时恢复。格式：mem_types=0101...（14 个 '0'/'1'）。
+static void SaveMemTypeConfig() {
+    std::string path = GetConfigFilePath();
+    if (path.empty()) return;
+    std::string line = "mem_types=";
+    for (int i = 0; i < kMemTypeCount; ++i)
+        line += g_mem_type_show[i] ? '1' : '0';
+    line += "\n";
+    std::ofstream ofs(path, std::ios::trunc);
+    if (ofs) ofs << line;
+}
+
+static void LoadMemTypeConfig() {
+    std::string path = GetConfigFilePath();
+    if (path.empty()) return;
+    std::ifstream ifs(path);
+    std::string line;
+    while (std::getline(ifs, line)) {
+        if (line.rfind("mem_types=", 0) != 0) continue;
+        const char* v = line.c_str() + 10;
+        for (int i = 0; i < kMemTypeCount && v[i]; ++i)
+            g_mem_type_show[i] = (v[i] == '1');
+        break;
+    }
+}
+
+void LoadMemTypeConfigOnce() {
+    static bool loaded = false;
+    if (!loaded) {
+        loaded = true;
+        LoadMemTypeConfig();
+    }
 }
 
 } // 命名空间 aimgui

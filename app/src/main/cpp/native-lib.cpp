@@ -134,6 +134,14 @@ static std::atomic<float>   g_ScreenH{0.0f};
 static std::mutex  g_inject_mutex;
 static std::string g_injector_path;
 static std::string g_agent_path;
+static std::string g_config_dir;   // App 私有 files 目录（配置文件存放处）
+
+// 配置文件路径（App 私有 files 目录，免 root）。
+std::string GetConfigFilePath() {
+    return g_config_dir.empty()
+               ? ""
+               : g_config_dir + "/universal_debug_tool.conf";
+}
 
 // 返回解压后的注入器路径（断点服务使用）。
 std::string GetInjectorPath() {
@@ -923,6 +931,15 @@ Java_com_example_unversaldebugtool_MainActivity_nativeSetInjectorInfo(
     }
     if (ip) env->ReleaseStringUTFChars(injectorPath, ip);
     if (ap) env->ReleaseStringUTFChars(agentPath, ap);
+}
+
+// 配置文件目录（App 私有 files 目录，由 Java 传入）。
+JNIEXPORT void JNICALL
+Java_com_example_unversaldebugtool_MainActivity_nativeSetConfigDir(
+    JNIEnv* env, jobject, jstring dir) {
+    const char* d = dir ? env->GetStringUTFChars(dir, nullptr) : nullptr;
+    g_config_dir = d ? d : "";
+    if (d) env->ReleaseStringUTFChars(dir, d);
 }
 
 // ── 状态查询（任意线程调用，无锁）──

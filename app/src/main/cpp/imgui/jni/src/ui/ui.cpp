@@ -437,6 +437,8 @@ void DrawResizeGrip(const UiState* state) {
 
 void DrawUi(UiState* state, bool* keep_running) {
     ApplyStyleOnce();
+    CheckTargetAlive();   // 目标进程销毁后自动重置相关状态
+    LoadMemTypeConfigOnce();  // 启动时恢复内存类型配置
 
     ImGuiIO& io = ImGui::GetIO();
     const float dt = io.DeltaTime > 0.0f ? io.DeltaTime : 1.0f / 60.0f;

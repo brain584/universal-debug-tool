@@ -306,6 +306,7 @@ class MainActivity : AppCompatActivity() {
             val injectorPath = ensureInjectorExtracted()
             val agentPath = ensureAgentExtracted()
             nativeSetInjectorInfo(injectorPath, agentPath)
+            nativeSetConfigDir(filesDir.absolutePath)
 
             updateSurfaceOrigin()
             updatePanelWindowSize()
@@ -801,6 +802,7 @@ class MainActivity : AppCompatActivity() {
     private external fun nativeSetSurfaceOrigin(x: Float, y: Float, viewW: Float, viewH: Float, screenW: Float, screenH: Float)
     private external fun nativeSetPanelOrigin(x: Float, y: Float)
     private external fun nativeSetInjectorInfo(injectorPath: String, agentPath: String)
+    private external fun nativeSetConfigDir(dir: String)
 
     // 状态查询
     private external fun nativeWantKeyboard(): Boolean
