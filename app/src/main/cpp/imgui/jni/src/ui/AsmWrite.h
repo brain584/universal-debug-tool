@@ -73,6 +73,28 @@ static inline bool ParseImm(const char* s, int64_t& out) {
     return true;
 }
 
+// 解析 AArch64 条件码（cset w0, ne / b.ne 等），返回 asmjit
+// 的 CondCode 数值（kEQ=2, kNE=3, ...，与 opcode 字段差 2）。
+static inline bool ParseCondCode(const std::string& tok, uint32_t& cc) {
+    if      (tok == "eq") cc = (uint32_t)arm::CondCode::kEQ;
+    else if (tok == "ne") cc = (uint32_t)arm::CondCode::kNE;
+    else if (tok == "cs" || tok == "hs") cc = (uint32_t)arm::CondCode::kCS;
+    else if (tok == "cc" || tok == "lo") cc = (uint32_t)arm::CondCode::kCC;
+    else if (tok == "mi") cc = (uint32_t)arm::CondCode::kMI;
+    else if (tok == "pl") cc = (uint32_t)arm::CondCode::kPL;
+    else if (tok == "vs") cc = (uint32_t)arm::CondCode::kVS;
+    else if (tok == "vc") cc = (uint32_t)arm::CondCode::kVC;
+    else if (tok == "hi") cc = (uint32_t)arm::CondCode::kHI;
+    else if (tok == "ls") cc = (uint32_t)arm::CondCode::kLS;
+    else if (tok == "ge") cc = (uint32_t)arm::CondCode::kGE;
+    else if (tok == "lt") cc = (uint32_t)arm::CondCode::kLT;
+    else if (tok == "gt") cc = (uint32_t)arm::CondCode::kGT;
+    else if (tok == "le") cc = (uint32_t)arm::CondCode::kLE;
+    else if (tok == "al") cc = (uint32_t)arm::CondCode::kAL;
+    else return false;
+    return true;
+}
+
 static inline bool ParseGpReg(const std::string& tok, a64::Gp& out) {
     if (tok == "xzr") { out = a64::Gp::make_x(a64::Gp::kIdZr); return true; }
     if (tok == "wzr") { out = a64::Gp::make_w(a64::Gp::kIdZr); return true; }
@@ -251,8 +273,42 @@ static inline bool Assemble(const char* text, std::vector<uint8_t>& bytes,
     std::string opsStr =
         (sp == std::string::npos) ? "" : Trim(s.substr(sp + 1));
 
+    // 助记符可能带条件码后缀：b.ne / csel.eq 等。
+    uint32_t condVal = 0;   // asmjit CondCode 数值（kAL=0, kEQ=2, ...）
+    bool hasCond = false;
+    size_t dot = mnem.find('.');
+    if (dot != std::string::npos) {
+        std::string ccStr = mnem.substr(dot + 1);
+        if (!ParseCondCode(ccStr, condVal)) {
+            err = "无法解析条件码: " + ccStr;
+            return false;
+        }
+        mnem = mnem.substr(0, dot);
+        hasCond = true;
+    }
+
     std::vector<std::string> toks;
     SplitTop(opsStr, ',', toks);
+
+    // cset 家族的条件码是最后一个操作数（cset w0, ne / csel w0,w1,w2,gt），
+    // asmjit 中它们以 Imm 操作数形式传给编码器。
+    static const char* kCondOpMnems[] = {
+        "cset", "csetm", "csel", "csinc", "csinv", "csneg",
+        "cinc", "cinv", "cneg", "ccmn", "ccmp"
+    };
+    bool condOpMnem = false;
+    for (const char* m : kCondOpMnems) {
+        if (mnem == m) { condOpMnem = true; break; }
+    }
+    if (condOpMnem && !hasCond && !toks.empty()) {
+        uint32_t cc = 0;
+        if (ParseCondCode(Trim(toks.back()), cc)) {
+            condVal = cc;
+            hasCond = true;
+            toks.pop_back();
+        }
+    }
+
     Operand_ ops[4];
     size_t opCount = 0;
     for (const auto& t : toks) {
@@ -261,6 +317,11 @@ static inline bool Assemble(const char* text, std::vector<uint8_t>& bytes,
         if (opCount >= 4) { err = "操作数过多"; return false; }
         if (!ParseOperand(tok, ops[opCount], err)) return false;
         opCount++;
+    }
+    // cset 家族：把条件码作为最后一个 Imm 操作数追加
+    if (condOpMnem && hasCond) {
+        if (opCount >= 4) { err = "操作数过多"; return false; }
+        ops[opCount++] = Imm((int64_t)condVal);
     }
 
     InstId id = asmjit::InstAPI::string_to_inst_id(
@@ -282,6 +343,9 @@ static inline bool Assemble(const char* text, std::vector<uint8_t>& bytes,
         err = "未知指令: " + mnem;
         return false;
     }
+    // 分支等以 inst_id 携带条件码的指令（b.ne 等）
+    if (hasCond && !condOpMnem)
+        id = asmjit::BaseInst::compose_arm_inst_id(id, (arm::CondCode)condVal);
 
     Environment env(Arch::kAArch64);
     CodeHolder code;

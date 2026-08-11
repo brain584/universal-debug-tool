@@ -11,11 +11,11 @@
   - 解析 `/proc/<pid>/maps` 与 `/proc/<pid>/mem`，按 GG 风格对内存页分类（code app、code system、anonymous、java heap、cpp heap、stack、ashmem 等）。
   - 连续 / 分页两种浏览模式，支持内存类型多选筛选、数值类型切换（dword、float、utf8、utf16、hex 等）。
   - 单条内存修改、偏移跳转、地址保存页、链接库基址跳转。
-  - 内存搜索：精确搜索、模糊搜索、改善搜索结果，内存类型可多选。
+  - 内存搜索：精确搜索、模糊搜索、改善搜索结果，内存类型可多选（精确 / 范围搜索基于 MemorySearch 引擎，多线程扫描）。
 - **动态调试**
   - LuaJIT 脚本引擎（FFI）：`hookfunc` inline hook、`hookCPU` 寄存器级插桩、`call` 主动调用、内存读写辅助。
   - 硬件断点（root）：对目标进程所有线程下断，命中后回传寄存器、PC 与堆栈，地址可点击跳转内存页。
-  - 反汇编（capstone）与汇编写入（asmjit）：内存页内可直接修改指令，例如输入 `~A8 nop`。
+  - 反汇编（capstone）与汇编写入（asmjit）：内存页内可直接修改指令，例如输入 `~A8 nop`、`~A8 cset w0, ne`。
 - **悬浮窗 GUI**：ImGui 界面，支持收起 / 展开，解决触摸穿透、拉起输入法、可执行内存读写等功能。
 
 ## 构建
@@ -29,7 +29,7 @@
 
 | 目录 | 说明 |
 | --- | --- |
-| `imgui` | GUI 端：悬浮窗渲染、ImGui 界面、触摸处理、socket 客户端、内存搜索、反汇编、汇编写入；所依赖的开源库（imgui、capstone、asmjit 等）直接放在该目录下 |
+| `imgui` | GUI 端：悬浮窗渲染、ImGui 界面、触摸处理、socket 客户端、内存搜索、反汇编、汇编写入；所依赖的开源库（imgui、capstone、asmjit、memsearch 等）直接放在该目录下 |
 | `agent` | SO 端：注入目标进程，内置 LuaJIT、Dobby、xDL、socket 服务端与内存工具 |
 | `injector` | 注入器：ptrace 注入、ELF 解析、root 服务（密钥生成、socket relay、断点服务） |
 
@@ -53,6 +53,11 @@
   - `read*` / `write*`：内存读写辅助函数。
 - hook 回调与脚本执行共用递归互斥锁，避免回调中再次执行 Lua 造成死锁。
 
+### 内存搜索
+
+- 搜索引擎运行在 imgui 侧（MemorySearch，MIT）：GUI 进程非 root，无法直接 open 目标进程 `/proc/<pid>/mem`，因此通过新增的 MemSu 后端（`su` + `dd` 管道）读写目标内存，`maps` 枚举同样走 su，不占用 agent socket 通道。
+- 精确 / 范围搜索已接入该引擎（多线程并行扫描）；模糊搜索与"改善"仍为旧实现，后续迁移。
+
 ### 断点实现
 
 - 断点服务以 root 运行（注入器 `--bp` 模式），基于 Linux `perf_event_open` 硬件断点（`PERF_TYPE_BREAKPOINT`），由内核直接编程 CPU 调试寄存器。
@@ -68,7 +73,7 @@
 
 ## 可优化方向
 
-- 内存搜索耗时较长：当前搜索由 GUI 端组织、经 socket 逐页读取内存；可改为 agent 端直接搜索并返回结果集，或按页批量读取缓存。
+- 模糊搜索与"改善"尚未迁移到 MemorySearch 引擎（仍为单块 su 读取 + 单线程扫描），后续可改用引擎的快照比较（CHANGED / INCREASED / DECREASED 等）进一步提升速度。
 - 子窗口渲染与触摸分发：可考虑子窗口独立纹理渲染、统一触摸事件分发路径，从根源上解决闪现与触摸拦截问题。
 
 ## 参考库与改动说明
@@ -83,6 +88,7 @@
 | [LuaJIT](https://github.com/LuaJIT/LuaJIT) | 脚本引擎 | 未改源码 | MIT |
 | [Dobby](https://github.com/jmpews/Dobby) | inline hook | 未改源码，使用预编译 `libdobby.a`，经 LuaEngine 薄封装 | Apache-2.0 |
 | [AndroidInject](https://github.com/niqiuqiux/AndroidInject) | ptrace 注入器基础 | 未改源码 | 上游未确认，详见上游仓库 |
+| [MemorySearch](https://github.com/Aboy-g/MemorySearch) | 内存读写 / 搜索（imgui 侧） | 剔除 Keystone 依赖（write_assembly，避免引入 GPL）；新增 su 后端适配器 MemSu；maps 读取改为 su 管道；源码位于 `imgui/jni/memsearch` | MIT |
 
 ## 开源协议
 
@@ -90,14 +96,16 @@
 
 ## 致谢
 
-感谢以下开源项目及其作者：Qimgui、ImGui、asmjit、capstone、xDL、LuaJIT、Dobby、AndroidInject。
+感谢以下开源项目及其作者：Qimgui、ImGui、asmjit、capstone、xDL、LuaJIT、Dobby、AndroidInject、MemorySearch。
 
-特别感谢 AlguiMemTool.h 的作者 **ByteCat**（MIT License）：本项目内存搜索功能基于该库实现，使用过程中保留了原始版权声明与注释。
+特别感谢 AlguiMemTool.h 的作者 **ByteCat**（MIT License）：本项目内存分类规则（MemToolTypes.h）基于该库提取，使用过程中保留了原始版权声明与注释。
+
+特别感谢 MemorySearch 的作者 **Aboy-g**（MIT License）：本项目内存搜索引擎基于该库，已剔除其 Keystone 依赖并保留原始 LICENSE。
 
 特别感谢 Codex（OpenAI）在本项目开发过程中协助编写代码。
 
 ## 免责声明
 
-1. 内存搜索库 `AlguiMemTool.h` 并非本人作品，本人仅借用该库进行使用；为尊重作者意愿，未对该库中的版权声明及注释进行任何删改。
+1. 内存分类定义 `MemToolTypes.h` 提取自 AlguiMemTool.h（作者 ByteCat，MIT License）；为尊重作者意愿，提取时保留了原始版权声明与作者信息。
 2. 本工具仅限用于合法用途（如学习研究、对自己拥有权限的程序进行调试等），禁止用于任何非法活动；使用者需自行承担使用本工具产生的全部法律责任。
 3. 本人不一定会对该项目进行维护，如有需求者，请自行下载源码修改并编译。

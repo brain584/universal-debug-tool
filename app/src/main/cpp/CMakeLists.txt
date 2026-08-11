@@ -54,6 +54,15 @@ add_library(unversaldebugtool SHARED
     ${IMGUI_ROOT}/jni/src/ui/main_ui.cpp
     ${IMGUI_ROOT}/jni/src/socket/SocketClient.cpp
     ${IMGUI_ROOT}/jni/src/bp/BpService.cpp
+    # MemorySearch：imgui 侧内存读写 / 搜索库（MIT，已去除 Keystone 依赖）
+    ${IMGUI_ROOT}/jni/memsearch/Mem.cpp
+    ${IMGUI_ROOT}/jni/memsearch/Membase.cpp
+    ${IMGUI_ROOT}/jni/memsearch/MemMmap.cpp
+    ${IMGUI_ROOT}/jni/memsearch/MemSu.cpp
+    ${IMGUI_ROOT}/jni/memsearch/Process.cpp
+    ${IMGUI_ROOT}/jni/memsearch/ProcIO.cpp
+    ${IMGUI_ROOT}/jni/memsearch/Search.cpp
+    ${IMGUI_ROOT}/jni/memsearch/FuzzySearch.cpp
 )
 
 target_include_directories(unversaldebugtool PRIVATE
@@ -68,6 +77,7 @@ target_include_directories(unversaldebugtool PRIVATE
     ${IMGUI_ROOT}/jni/src/socket
     ${CMAKE_CURRENT_SOURCE_DIR}/imgui/jni/capstone/include
     ${CMAKE_CURRENT_SOURCE_DIR}/imgui/jni/asmjit
+    ${IMGUI_ROOT}/jni/memsearch
 )
 
 # AsmJit：内存编辑器的 AArch64 文本汇编（imgui 侧）

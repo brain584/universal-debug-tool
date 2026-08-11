@@ -26,7 +26,11 @@
 #include "bp/BpService.h"
 #include "Disasm.h"
 #include "AsmWrite.h"
+#include "MemSu.hpp"
+#include "Search.hpp"
 #include "MemToolTypes.h"
+
+#include <limits>
 
 // 由 native-lib.cpp 提供：在 `su` 下运行独立注入器并
 // 返回捕获的输出。
@@ -2010,54 +2014,80 @@ static void SearchExactRun(int pid, std::vector<int> areas, int type,
             return;
         }
 
-        std::vector<SearchMapRegion> regions;
-        std::string err;
-        bool loaded = LoadSearchRegions(pid, regions, err);
-        if (!loaded) {
-            std::lock_guard<std::mutex> lk(g_search_mutex);
-            g_search_status = err;
-            g_search_running.store(false);
-            return;
-        }
-
-        const int stride = MemTypeSize(type);
         bool isFloat = (type == TYPE_FLOAT || type == TYPE_DOUBLE);
-        std::vector<uint8_t> buf(kSearchChunk);
+        // 使用 MemorySearch 引擎（imgui 侧，su 后端）扫描
+        MemSu mem(pid);
+        SearchEngine engine(mem);
+        SearchParams params;
+        params.memTypeMask = 0;  // 0 = 全部区域
+        for (int a : areas) {
+            if (a == RANGE_ALL) { params.memTypeMask = 0; break; }
+            params.memTypeMask |= (a == RANGE_OTHER) ? ((uint32_t)1u << 31)
+                                                     : (uint32_t)a;
+        }
+        params.maxResults = kSearchMaxExact;
+        params.align = true;
+        params.parallel = true;
+        params.numThreads = 4;  // 限制并发 su 管道数量，避免过载
         bool capped = false;
-        for (const auto& reg : regions) {
-            bool areaOk = false;
-            for (int aid : areas)
-                if (BCMAPSFLAG(reg.line.c_str(), aid)) { areaOk = true; break; }
-            if (!areaOk) continue;
-            uintptr_t start = (reg.start + 4095) & ~(uintptr_t)4095;
-            uintptr_t end = reg.end & ~(uintptr_t)4095;
-            for (uintptr_t addr = start; addr < end && !capped;
-                 addr += kSearchChunk) {
-                size_t want =
-                    (size_t)std::min<uintptr_t>(kSearchChunk, end - addr);
-                if (!ReadRemoteChunk(pid, addr, buf.data(), want)) continue;
-                for (size_t i = 0; i + (size_t)stride <= want;
-                     i += (size_t)stride) {
-                    int64_t ival = 0;
-                    double dval = 0;
-                    ExtractSearchVal(buf.data() + i, type, ival, dval);
-                    bool match = isFloat
-                        ? (isRange ? (dval >= dmin && dval <= dmax)
-                                   : dval == dv)
-                        : (isRange ? (ival >= imin && ival <= imax)
-                                   : ival == iv);
-                    if (match) {
-                        SearchHit h;
-                        h.addr = addr + i;
-                        ReadSearchRaw(buf.data() + i, type, h.val);
-                        hits.push_back(h);
-                        if (hits.size() >= kSearchMaxExact) {
-                            capped = true;
-                            break;
-                        }
-                    }
+
+        auto collect = [&](uintptr_t addr, uint64_t raw) {
+            if (hits.size() >= kSearchMaxExact) { capped = true; return; }
+            SearchHit h;
+            h.addr = addr;
+            h.val = raw;
+            hits.push_back(h);
+        };
+        auto runSearch = [&](auto* tag) {
+            using T = std::decay_t<decltype(*tag)>;
+            if (isRange) {
+                long double lo = isFloat ? (long double)dmin
+                                         : (long double)imin;
+                long double hi = isFloat ? (long double)dmax
+                                         : (long double)imax;
+                // 范围超出类型宽度则无结果（与旧的按类型截断语义一致）
+                if (lo < (long double)std::numeric_limits<T>::lowest() ||
+                    hi > (long double)std::numeric_limits<T>::max())
+                    return;
+                auto rs = engine.searchRange<T>(params, (T)lo, (T)hi);
+                for (const auto& r : rs.results()) {
+                    if (capped) break;
+                    uint64_t raw = 0;
+                    memcpy(&raw, &r.value, sizeof(T) <= 8 ? sizeof(T) : 8);
+                    collect(r.address, raw);
+                }
+            } else {
+                long double v = isFloat ? (long double)dv
+                                        : (long double)iv;
+                auto rs = engine.search<T>(params, (T)v);
+                for (const auto& r : rs.results()) {
+                    if (capped) break;
+                    uint64_t raw = 0;
+                    memcpy(&raw, &r.value, sizeof(T) <= 8 ? sizeof(T) : 8);
+                    collect(r.address, raw);
                 }
             }
+        };
+
+        try {
+            switch (type) {
+            case TYPE_BYTE:   runSearch((int8_t*)nullptr);  break;
+            case TYPE_WORD:   runSearch((int16_t*)nullptr); break;
+            case TYPE_DWORD:  runSearch((int32_t*)nullptr); break;
+            case TYPE_QWORD:  runSearch((int64_t*)nullptr); break;
+            case TYPE_FLOAT:  runSearch((float*)nullptr);   break;
+            case TYPE_DOUBLE: runSearch((double*)nullptr);  break;
+            default:
+                std::lock_guard<std::mutex> lk(g_search_mutex);
+                g_search_status = u8"不支持的数值类型";
+                g_search_running.store(false);
+                return;
+            }
+        } catch (const std::exception& ex) {
+            std::lock_guard<std::mutex> lk(g_search_mutex);
+            g_search_status = std::string("搜索异常: ") + ex.what();
+            g_search_running.store(false);
+            return;
         }
 
         double sec = std::chrono::duration<double>(
