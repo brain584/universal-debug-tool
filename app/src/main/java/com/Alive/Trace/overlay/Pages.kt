@@ -173,10 +173,10 @@ class OptionsPage(private val m: OverlayManager) : OverlayPage {
 
         col.addView(section(ctx, "SO "))
         val soValue = TextView(ctx).apply {
-            text = "退出悬浮窗"
+            text = "查看连接状态"
             setTextColor(0xFF888888.toInt())
         }
-        col.addView(optionRow(ctx, " agent (/hook)", soValue) { soDialog(soValue) })
+        col.addView(optionRow(ctx, " socket连接", soValue) { soDialog(soValue) })
 
         col.addView(optionRow(ctx, "退出悬浮窗", TextView(ctx).apply {
             text = "›"
@@ -406,9 +406,9 @@ class OptionsPage(private val m: OverlayManager) : OverlayPage {
             boxes.add(id to cb)
             body.addView(cb)
         }
-        m.dialog("输入要搜索的值", body, listOf(
+        m.dialog("选择内存类型", body, listOf(
             Triple("否", false) {},
-            Triple("改善", true) {
+            Triple("保存", true) {
                 OState.areas.clear()
                 for ((id, cb) in boxes) if (cb.isChecked) OState.areas.add(id)
                 if (OState.areas.isEmpty()) OState.areas.add(Areas.ALL)
@@ -431,7 +431,7 @@ class OptionsPage(private val m: OverlayManager) : OverlayPage {
             textSize = 12f
             setTextColor(0xFF444444.toInt())
         }
-        val byPid = btn(ctx, " (PID)") {
+        val byPid = btn(ctx, " 当前进程注入") {
             if (OState.pid <= 0) { m.toast("请先选择进程"); return@btn }
             runInject(resultTv) { NativeBridge.injectPid(OState.pid) }
         }
@@ -924,7 +924,7 @@ class SavedPage(private val m: OverlayManager) : OverlayPage {
         val input = edit(ctx, r.valueText).apply { setText(r.valueText) }
         body.addView(input)
         val freeze = CheckBox(ctx).apply {
-            text = "暂无保存（在搜索页勾选后保存）"
+            text = "冻结"
             textSize = 14f
             isChecked = r.frozen
         }
@@ -1095,7 +1095,7 @@ class MemoryPage(private val m: OverlayManager) : OverlayPage {
                                 "v", "%08X".format(v)))
                             m.toast("(hex)")
                         },
-            Triple("分配", true) {
+            Triple("复制值", true) {
                             base = a
                             refresh()
                         }))
