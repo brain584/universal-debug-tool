@@ -49,6 +49,7 @@ target_link_options(agent PRIVATE -static-libstdc++)
 # 编译 JNI 桥接层与用户 UI 源码，链接预编译的 AImGui 静态库进行渲染。
 add_library(unversaldebugtool SHARED
     native-lib.cpp
+    overlay_bridge.cpp
     # AImGui UI 层：Dynamic Island 侧边栏 + 各功能页
     ${IMGUI_ROOT}/jni/src/ui/ui.cpp
     ${IMGUI_ROOT}/jni/src/ui/main_ui.cpp

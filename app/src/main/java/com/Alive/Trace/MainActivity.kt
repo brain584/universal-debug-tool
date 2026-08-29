@@ -37,6 +37,7 @@ import com.Alive.Trace.ui.AboutCard
 import com.Alive.Trace.ui.AccentThemes
 import com.Alive.Trace.ui.PermissionCard
 import com.Alive.Trace.ui.ProcessCard
+import com.Alive.Trace.overlay.OverlayManager
 import com.Alive.Trace.ui.StatusCard
 
 class MainActivity : AppCompatActivity() {
@@ -47,6 +48,9 @@ class MainActivity : AppCompatActivity() {
     private lateinit var aboutCard: AboutCard
     private val handler = Handler(Looper.getMainLooper())
     private var overlayAdded = false
+
+    // 原生 View 悬浮窗（ATrace v2，替代 ImGui 界面）。
+    private var overlayManager: OverlayManager? = null
 
     // 运行时长计时（Overlay 启动时刻，0 = 未运行）。
     private var overlayStartElapsed = 0L
@@ -321,7 +325,7 @@ class MainActivity : AppCompatActivity() {
 
     override fun onDestroy() {
         super.onDestroy()
-        if (overlayAdded) {
+        if (overlayManager != null) {
             stopOverlay()
         }
     }
@@ -353,106 +357,53 @@ class MainActivity : AppCompatActivity() {
     // ── 悬浮层管理 ──
 
     private fun startOverlay() {
-        if (overlayAdded) return
+        if (overlayManager != null) return
 
-        val ctx = applicationContext
+        // 原生 View 悬浮窗（ATrace v2，暂时替代 ImGui 界面）：
+        // 可拖动气泡 + 全屏半透明面板，后端复用注入器与 memsearch 引擎。
+        overlayManager = OverlayManager(this, onExit = {
+            overlayManager = null
+            stopOverlayUiState()
+        })
 
-        val container = FrameLayout(ctx).apply {
-            setBackgroundColor(0x00000000) // 完全透明
-            setOnTouchListener { _, event -> handleTouch(event) }
-        }
+        // 悬浮层启动时请求一次 root（触发
+        // Magisk/KernelSU 授权弹窗，如果尚未授权）。
+        requestRoot()
 
-        // 输入法键盘使用的隐形 EditText。自定义 EditText 包装
-        // InputConnection，使每个输入法操作（字符、退格、
-        // 光标移动、回车）都以按键 / 字符事件转发给 ImGui。
-        imeEditText = ImGuiEditText(ctx).apply {
-            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS
-            setBackgroundColor(0x00000000)
-            setTextColor(0x00000000)
-            setCursorVisible(false)
-            isFocusable = true
-            isFocusableInTouchMode = true
-            showSoftInputOnFocus = true
-            layoutParams = FrameLayout.LayoutParams(1, 1).apply {
-                gravity = Gravity.TOP or Gravity.LEFT
-            }
-        }
-        container.addView(imeEditText)
+        // 从 assets 解压独立 ptrace 注入器，并告诉
+        // native agent .so 的位置，这样注入功能可以按需注入。
+        val injectorPath = ensureInjectorExtracted()
+        val agentPath = ensureAgentExtracted()
+        nativeSetInjectorInfo(injectorPath, agentPath)
+        nativeSetConfigDir(filesDir.absolutePath)
 
-        // 用于 native ImGui 渲染的 SurfaceView；铺满面板窗口。
-        surfaceView = SurfaceView(ctx).apply {
-            setZOrderOnTop(true)
-            holder.setFormat(PixelFormat.TRANSLUCENT)
-            holder.addCallback(surfaceCallback)
-        }
-        container.addView(surfaceView, FrameLayout.LayoutParams(
-            FrameLayout.LayoutParams.MATCH_PARENT,
-            FrameLayout.LayoutParams.MATCH_PARENT
-        ))
+        overlayManager!!.show()
 
-        panelOverlay = container
+        statusCard.setRunning(true)
+        overlayStartElapsed = SystemClock.elapsedRealtime()
+        startRuntimeTicker()
+        rootCheckDone = false
+        checkRootAsync()
 
-        try {
-            windowManager?.addView(panelOverlay, panelLayoutParams)
-            overlayAdded = true
-
-            // 悬浮层启动时请求一次 root（触发
-            // Magisk/KernelSU 授权弹窗，如果尚未授权）。
-            requestRoot()
-
-            // 从 assets 解压独立 ptrace 注入器，并告诉
-            // native agent .so 的位置，这样 imgui 的"注入"按钮可以
-            // 按需注入。
-            val injectorPath = ensureInjectorExtracted()
-            val agentPath = ensureAgentExtracted()
-            nativeSetInjectorInfo(injectorPath, agentPath)
-            nativeSetConfigDir(filesDir.absolutePath)
-
-            updateSurfaceOrigin()
-            updatePanelWindowSize()
-
-            handler.post(overlayPoller)
-
-            // 同步启动界面状态并开始计时。
-            statusCard.setRunning(true)
-            overlayStartElapsed = SystemClock.elapsedRealtime()
-            startRuntimeTicker()
-            rootCheckDone = false
-            checkRootAsync()
-
-            moveTaskToBack(true)
-            Toast.makeText(this, "ImGui overlay started", Toast.LENGTH_SHORT).show()
-        } catch (e: Exception) {
-            Toast.makeText(this, "Failed to create overlay: ${e.message}", Toast.LENGTH_LONG).show()
-            statusCard.setRunning(false)
-        }
+        moveTaskToBack(true)
+        Toast.makeText(this, "悬浮窗已启动（拖动图标，点击展开）",
+            Toast.LENGTH_SHORT).show()
     }
 
     private fun stopOverlay() {
-        if (!overlayAdded) return
+        overlayManager?.hide()
+        overlayManager = null
+        stopOverlayUiState()
+        Toast.makeText(this, "悬浮窗已停止", Toast.LENGTH_SHORT).show()
+    }
 
-        handler.removeCallbacks(overlayPoller)
-
-        surfaceView?.holder?.removeCallback(surfaceCallback)
-
-        nativeStopRender()
-        nativeSurfaceDestroyed()
-
-        try { windowManager?.removeView(panelOverlay) } catch (_: Exception) {}
-
-        panelOverlay = null
-        surfaceView = null
-        imeEditText = null
-        overlayAdded = false
-
-        // 同步启动界面状态并复位计时。
+    // 同步启动界面状态并复位计时（不触碰悬浮窗本身）。
+    private fun stopOverlayUiState() {
         if (::statusCard.isInitialized) {
             statusCard.setRunning(false)
             stopRuntimeTicker()
             aboutCard.setRuntime("00:00:00")
         }
-
-        Toast.makeText(this, "ImGui overlay stopped", Toast.LENGTH_SHORT).show()
     }
 
     // ImGui 界面自行退出（native 渲染循环结束）后，同步开关与状态卡片。

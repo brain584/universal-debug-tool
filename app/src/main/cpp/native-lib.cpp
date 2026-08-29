@@ -445,7 +445,7 @@ static void RenderLoop() {
 // 并返回捕获的输出。必须在后台线程调用：
 // `su` + ptrace 注入可能耗时，
 // 绝不能阻塞渲染线程。
-static std::string RunInjectorArgs(const std::string& args) {
+std::string RunInjectorArgs(const std::string& args) {
     std::string inj, agent;
     {
         std::lock_guard<std::mutex> lk(g_inject_mutex);

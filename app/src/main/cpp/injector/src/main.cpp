@@ -3,6 +3,7 @@
 #include "Injector.h"
 #include "ProcessMonitor.h"
 #include "BreakpointService.h"
+#include "RemoteProcess.h"
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -15,6 +16,7 @@
 #include <sys/select.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/mman.h>
 #include <sys/un.h>
 #include <android/log.h>
 
@@ -135,6 +137,8 @@ int main(int argc, char* argv[]) {
     unsigned int delay = 0;
     int timeout = -1;
     std::string relayPath;
+    std::string protStr;
+    unsigned long long allocSize = 0;
     pid_t bpPid = 0;
     
     // 解析命令行
@@ -153,12 +157,14 @@ int main(int argc, char* argv[]) {
         {"no-copy",     no_argument,       nullptr, 'n'},
         {"relay",       required_argument, nullptr, 'r'},
         {"bp",          required_argument, nullptr, 'B'},
+        {"alloc",        required_argument, nullptr, 'A'},
+        {"prot",         required_argument, nullptr, 'P'},
         {"help",        no_argument,       nullptr, 'h'},
         {nullptr, 0, nullptr, 0}
     };
     
     int opt;
-    while ((opt = getopt_long(argc, argv, "p:l:i:mHSwd:Dt:nChr:B:", longOpts, nullptr)) != -1) {
+    while ((opt = getopt_long(argc, argv, "p:l:i:mHSwd:Dt:nChr:B:AP:", longOpts, nullptr)) != -1) {
         switch (opt) {
             case 'p': pkgName = optarg; break;
             case 'l': libPath = optarg; break;
@@ -174,6 +180,8 @@ int main(int argc, char* argv[]) {
             case 'n': copyToPrivate = false; break;
             case 'r': relayPath = optarg; break;
             case 'B': bpPid = atoi(optarg); break;
+            case 'A': allocSize = strtoull(optarg, nullptr, 0); break;
+            case 'P': protStr = optarg; break;
             case 'h':
                 printUsage(argv[0]);
                 return 0;
@@ -192,6 +200,26 @@ int main(int argc, char* argv[]) {
     // 中继模式不需要注入参数。
     if (!relayPath.empty()) {
         return RunRelay(relayPath.c_str());
+    }
+
+    // 远程内存分配模式：-i <pid> --alloc <size> --prot <rwx 组合>。
+    // 输出 "ALLOC 0x<地址>"，供悬浮窗内存页解析跳转。
+    if (allocSize > 0) {
+        if (targetPid <= 0) { LOGE("alloc mode needs -i <pid>"); return 1; }
+        int prot = 0;
+        for (char c : protStr) {
+            if (c == 'r') prot |= PROT_READ;
+            else if (c == 'w') prot |= PROT_WRITE;
+            else if (c == 'x') prot |= PROT_EXEC;
+        }
+        if (!prot) prot = PROT_READ | PROT_WRITE;
+        RemoteProcess rp(targetPid);
+        if (!rp.attach()) { LOGE("attach failed"); return 1; }
+        uintptr_t p = rp.remoteAlloc((size_t)allocSize, prot);
+        if (!p) { LOGE("remoteAlloc failed"); return 1; }
+        printf("ALLOC 0x%llx\n", (unsigned long long)p);
+        rp.detach();
+        return 0;
     }
 
     if (libPath.empty() || (pkgName.empty() && targetPid <= 0)) {
