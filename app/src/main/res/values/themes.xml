@@ -1,16 +1,65 @@
 <resources xmlns:tools="http://schemas.android.com/tools">
-    <!-- Base application theme. -->
+    <!-- 启动界面为固定深色设计，日夜间均使用同一深色主题。 -->
     <style name="Theme.UnversalDebugTool" parent="Theme.MaterialComponents.DayNight.NoActionBar">
-        <!-- Primary brand color. -->
-        <item name="colorPrimary">@color/purple_500</item>
-        <item name="colorPrimaryVariant">@color/purple_700</item>
-        <item name="colorOnPrimary">@color/white</item>
-        <!-- Secondary brand color. -->
-        <item name="colorSecondary">@color/teal_200</item>
-        <item name="colorSecondaryVariant">@color/teal_700</item>
-        <item name="colorOnSecondary">@color/black</item>
-        <!-- Status bar color. -->
-        <item name="android:statusBarColor">?attr/colorPrimaryVariant</item>
-        <!-- Customize your theme here. -->
+        <item name="colorPrimary">@color/accent</item>
+        <item name="colorPrimaryVariant">@color/accent_dim</item>
+        <item name="colorOnPrimary">@color/btn_text_dark</item>
+        <item name="colorSecondary">@color/accent</item>
+        <item name="colorSecondaryVariant">@color/accent_dim</item>
+        <item name="colorOnSecondary">@color/btn_text_dark</item>
+        <!-- 沉浸式：状态栏 / 导航栏与页面同色 -->
+        <item name="android:statusBarColor">@color/bg_page</item>
+        <item name="android:navigationBarColor">@color/bg_page</item>
+        <item name="android:windowBackground">@color/bg_page</item>
+        <item name="android:windowLightStatusBar" tools:targetApi="m">false</item>
+        <item name="accentColor">@color/accent</item>
+        <item name="accentDimColor">@color/accent_dim</item>
+    </style>
+
+    <!-- 头像圆形裁剪 -->
+    <style name="CircleImage">
+        <item name="cornerFamily">rounded</item>
+        <item name="cornerSize">50%</item>
+    </style>
+
+    <!-- 配色主题变体：只覆盖强调色，其余继承默认主题 -->
+    <style name="Theme.UnversalDebugTool.Blue">
+        <item name="colorPrimary">@color/accent_blue</item>
+        <item name="colorPrimaryVariant">@color/accent_blue_dim</item>
+        <item name="colorSecondary">@color/accent_blue</item>
+        <item name="accentColor">@color/accent_blue</item>
+        <item name="accentDimColor">@color/accent_blue_dim</item>
+    </style>
+
+    <style name="Theme.UnversalDebugTool.Purple">
+        <item name="colorPrimary">@color/accent_purple</item>
+        <item name="colorPrimaryVariant">@color/accent_purple_dim</item>
+        <item name="colorSecondary">@color/accent_purple</item>
+        <item name="accentColor">@color/accent_purple</item>
+        <item name="accentDimColor">@color/accent_purple_dim</item>
+    </style>
+
+    <style name="Theme.UnversalDebugTool.Orange">
+        <item name="colorPrimary">@color/accent_orange</item>
+        <item name="colorPrimaryVariant">@color/accent_orange_dim</item>
+        <item name="colorSecondary">@color/accent_orange</item>
+        <item name="accentColor">@color/accent_orange</item>
+        <item name="accentDimColor">@color/accent_orange_dim</item>
+    </style>
+
+    <style name="Theme.UnversalDebugTool.Cyan">
+        <item name="colorPrimary">@color/accent_cyan</item>
+        <item name="colorPrimaryVariant">@color/accent_cyan_dim</item>
+        <item name="colorSecondary">@color/accent_cyan</item>
+        <item name="accentColor">@color/accent_cyan</item>
+        <item name="accentDimColor">@color/accent_cyan_dim</item>
+    </style>
+
+    <style name="Theme.UnversalDebugTool.Pink">
+        <item name="colorPrimary">@color/accent_pink</item>
+        <item name="colorPrimaryVariant">@color/accent_pink_dim</item>
+        <item name="colorSecondary">@color/accent_pink</item>
+        <item name="accentColor">@color/accent_pink</item>
+        <item name="accentDimColor">@color/accent_pink_dim</item>
     </style>
 </resources>

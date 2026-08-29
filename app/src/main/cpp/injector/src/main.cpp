@@ -6,6 +6,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <unistd.h>
 #include <getopt.h>
 #include <dlfcn.h>
@@ -13,6 +14,7 @@
 #include <signal.h>
 #include <sys/select.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/un.h>
 #include <android/log.h>
 
@@ -68,10 +70,35 @@ static int RunRelay(const char* socket_path) {
     return 0;
 }
 
+// PID 直注入（native ELF 等非应用进程）时没有应用私有目录可放
+// agent：把它复制到 /data/local/tmp 并交给 shell 组，
+// 保证 root / shell 域的目标进程都能读取（目录权限由调用方
+// 先用 root chmod 777 开放）。
+static std::string CopyAgentToPublicTmp(const std::string& libPath) {
+    std::string base = libPath.substr(libPath.find_last_of('/') + 1);
+    std::string dst = "/data/local/tmp/" + base;
+    std::ifstream src(libPath, std::ios::binary);
+    if (!src) {
+        LOGE("Cannot open agent for copy: %s", libPath.c_str());
+        return libPath;
+    }
+    std::ofstream out(dst, std::ios::binary | std::ios::trunc);
+    if (!out) {
+        LOGE("Cannot write %s", dst.c_str());
+        return libPath;
+    }
+    out << src.rdbuf();
+    out.close();
+    chmod(dst.c_str(), 0644);
+    chown(dst.c_str(), 2000, 2000);  // shell:shell
+    LOGI("Agent copied to %s", dst.c_str());
+    return dst;
+}
+
 void printUsage(const char* prog) {
     printf("Usage: %s [options]\n", prog);
     printf("\nRequired:\n");
-    printf("  -p, --pkg <name>     Target package name\n");
+    printf("  -p, --pkg <name>     Target package name (可省略，若指定 -i)\n");
     printf("  -l, --lib <path>     Library path to inject\n");
     printf("\nOptional:\n");
     printf("  -i, --pid <pid>      Target PID (if known)\n");
@@ -167,8 +194,8 @@ int main(int argc, char* argv[]) {
         return RunRelay(relayPath.c_str());
     }
 
-    if (pkgName.empty() || libPath.empty()) {
-        LOGE("Missing required arguments");
+    if (libPath.empty() || (pkgName.empty() && targetPid <= 0)) {
+        LOGE("Missing required arguments (need -p <pkg> 或 -i <pid>, 以及 -l <lib>)");
         printUsage(argv[0]);
         return 1;
     }
@@ -220,6 +247,12 @@ int main(int argc, char* argv[]) {
     }
     
     LOGI("Target PID: %d", targetPid);
+
+    // PID 直注入：无包名时把 agent 复制到公共可读目录，
+    // 目标（root / shell 域）才能 dlopen 它。
+    if (pkgName.empty()) {
+        libPath = CopyAgentToPublicTmp(libPath);
+    }
     
     // 延迟
     if (delay > 0) {

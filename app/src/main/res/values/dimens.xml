@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- 页面 -->
+    <dimen name="page_padding">24dp</dimen>
+    <dimen name="card_gap">16dp</dimen>
+
+    <!-- 卡片 -->
+    <dimen name="card_radius">18dp</dimen>
+    <dimen name="card_padding">20dp</dimen>
+    <dimen name="card_title_size">20sp</dimen>
+
+    <!-- 权限 / 关于条目 -->
+    <dimen name="item_height">60dp</dimen>
+    <dimen name="item_icon">24dp</dimen>
+
+    <!-- 底部启动按钮 -->
+    <dimen name="launch_btn_height">64dp</dimen>
+    <dimen name="launch_btn_radius">18dp</dimen>
+
+    <!-- 其他 -->
+    <dimen name="status_dot">10dp</dimen>
+    <dimen name="tag_radius">8dp</dimen>
+    <dimen name="outline_btn_radius">10dp</dimen>
+</resources>

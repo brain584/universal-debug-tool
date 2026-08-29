@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 启动 Overlay 大按钮：绿色圆角 + 点击 ripple。 -->
+<ripple xmlns:android="http://schemas.android.com/apk/res/android"
+    android:color="#33000000">
+    <item>
+        <shape>
+            <solid android:color="@color/accent" />
+            <corners android:radius="@dimen/launch_btn_radius" />
+        </shape>
+    </item>
+</ripple>

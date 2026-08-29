@@ -7,4 +7,37 @@
     <color name="teal_700">#FF018786</color>
     <color name="black">#FF000000</color>
     <color name="white">#FFFFFFFF</color>
+
+    <!-- 启动界面配色（参照设计稿，固定深色） -->
+    <color name="bg_page">#FF0B0D10</color>
+    <color name="bg_card">#FF15181C</color>
+    <color name="accent">#FF6ED957</color>
+    <color name="accent_dim">#FF4CAF50</color>
+    <color name="dot_off">#FF5A5F66</color>
+    <color name="text_primary">#FFFFFFFF</color>
+    <color name="text_secondary">#FFAAAAAA</color>
+    <color name="text_muted">#FF9E9E9E</color>
+    <color name="text_dim">#FF888888</color>
+    <color name="text_hint">#FF777777</color>
+    <color name="text_item">#FFE0E0E0</color>
+    <color name="icon_tint">#FFC9CDD2</color>
+    <color name="tag_bg">#FF252930</color>
+    <color name="divider">#FF23272E</color>
+    <color name="switch_track_off">#FF2A2E35</color>
+    <color name="btn_text_dark">#FF000000</color>
+
+    <!-- 可选配色主题（强调色，深色背景通用） -->
+    <color name="accent_blue">#FF5AA7F7</color>
+    <color name="accent_blue_dim">#FF1E88E5</color>
+    <color name="accent_purple">#FFC39BFF</color>
+    <color name="accent_purple_dim">#FF8B5CF6</color>
+    <color name="accent_orange">#FFFFB74D</color>
+    <color name="accent_orange_dim">#FFFB8C00</color>
+    <color name="accent_cyan">#FF4DD0E1</color>
+    <color name="accent_cyan_dim">#FF00ACC1</color>
+    <color name="accent_pink">#FFFF80AB</color>
+    <color name="accent_pink_dim">#FFF50057</color>
+
+    <!-- 应用图标自适应背景（深色，衬托人像前景） -->
+    <color name="icon_bg">#FF10131A</color>
 </resources>

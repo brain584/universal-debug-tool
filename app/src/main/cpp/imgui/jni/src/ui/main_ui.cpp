@@ -37,6 +37,7 @@
 // 由 native-lib.cpp 提供：在 `su` 下运行独立注入器并
 // 返回捕获的输出。
 extern std::string RunInjector(const std::string& pkg);
+extern std::string RunInjectorPid(int pid);
 // 由 native-lib.cpp 提供：内存查看器使用的 root 内存辅助函数。
 extern std::string RunSuCommand(const std::string& cmd);
 extern std::string GetConfigFilePath();
@@ -107,6 +108,8 @@ static constexpr int      kMemPageSize = 8;
 static uint8_t            g_mem_page_bytes[kMemPageSize][16] = {{0}};
 static bool               g_mem_page_ok[kMemPageSize] = {false};
 static std::atomic<bool>  g_mem_values_loading{false};
+// 分页模式最近一次加载的地址列表（写入后自动刷新复用）。
+static std::vector<uintptr_t> g_mem_last_page_addrs;
 
 // 数值显示类型 + HEX 开关
 enum { kValDword = 0, kValFloat, kValUtf8, kValUtf16 };
@@ -278,6 +281,7 @@ static void MemClearValues() {
 static std::string DisasmFirstLine(int arch, const uint8_t* bytes, size_t n);
 
 static void MemLoadValuesForAddrs(int pid, const std::vector<uintptr_t>& addrs) {
+    g_mem_last_page_addrs = addrs;  // 供写入后自动刷新复用
     if (g_mem_values_loading.exchange(true)) return;
     int arch = g_disasm_arch;
     std::thread([pid, addrs, arch] {
@@ -362,6 +366,37 @@ static std::string DisasmFirstLine(int arch, const uint8_t* bytes, size_t n) {
         return "";
     std::string s = insns[0].mnemonic;
     if (!insns[0].op_str.empty()) s += " " + insns[0].op_str;
+    // capstone 把 LDR(literal) 家族（编码位 bits[29:24]=011x00）显示为
+    // 绝对地址，基址为 0 时就是偏移（如 ldr x0, 0xc）。改写为标准
+    // PC 相对格式 ldr x0, [pc, #0xc]，与 ~A8 汇编写入支持的写法一致。
+    if (a == udt_disasm::Arch::Arm64 && insns[0].size >= 4) {
+        uint32_t w = (uint32_t)insns[0].bytes[0] |
+                     ((uint32_t)insns[0].bytes[1] << 8) |
+                     ((uint32_t)insns[0].bytes[2] << 16) |
+                     ((uint32_t)insns[0].bytes[3] << 24);
+        uint32_t fam = w & 0x3F000000u;
+        if (fam == 0x18000000u || fam == 0x1C000000u) {
+            int64_t imm19 = (int64_t)(w >> 5) & 0x7FFFF;
+            if (imm19 & 0x40000) imm19 -= 0x80000;
+            int64_t off = imm19 * 4;
+            size_t comma = insns[0].op_str.find(',');
+            if (comma != std::string::npos) {
+                std::string first = insns[0].op_str.substr(0, comma);
+                size_t b = first.find_first_not_of(" \t");
+                if (b == std::string::npos) return s;
+                first = first.substr(
+                    b, first.find_last_not_of(" \t") - b + 1);
+                char buf[48];
+                if (off < 0)
+                    snprintf(buf, sizeof(buf), "[pc, #-0x%llx]",
+                             (unsigned long long)(-off));
+                else
+                    snprintf(buf, sizeof(buf), "[pc, #0x%llx]",
+                             (unsigned long long)off);
+                s = insns[0].mnemonic + " " + first + ", " + buf;
+            }
+        }
+    }
     return s;
 }
 
@@ -723,6 +758,39 @@ void DrawSelectProcess(UiState* state) {
         ImGui::Text(u8"已选择: %s(%d)", current_selection.package.c_str(), current_selection.pid);
     }
 
+    // ── 按 PID 注入：native ELF / 被列表过滤掉的进程 ──
+    // 普通可执行文件（如 /data/local/tmp 下运行的程序）没有包名，
+    // 且不在上面的应用进程列表里，只能直接给 PID。
+    ImGui::SeparatorText(u8"按 PID 注入（native ELF）");
+    static int manual_pid = 0;
+    ImGui::SetNextItemWidth(160);
+    ImGui::InputInt("##manual_pid", &manual_pid);
+    ImGui::SameLine();
+    if (ImGui::Button(u8"注入该 PID", ImVec2(120, 0))) {
+        if (manual_pid > 0) {
+            // 立即绑定为内存/断点页的目标进程，
+            // 注入本身在后台线程执行（绝不阻塞渲染线程）。
+            g_mem_pid.store(manual_pid);
+            g_mem_loaded.store(false);
+            g_mem_loading.store(false);
+            BindTargetAlive(manual_pid);
+            {
+                std::lock_guard<std::mutex> lk(g_inject_status_mutex);
+                if (!g_injecting) {
+                    g_injecting = true;
+                    g_inject_status = "正在注入...";
+                    int pid = manual_pid;
+                    std::thread([pid] {
+                        std::string out = RunInjectorPid(pid);
+                        std::lock_guard<std::mutex> lk2(g_inject_status_mutex);
+                        g_inject_status = out;
+                        g_injecting = false;
+                    }).detach();
+                }
+            }
+        }
+    }
+
     // ── SO 加密通道 ──────────────────────────────────────────────
     ImGui::SeparatorText(u8"SO 通道");
     {
@@ -829,6 +897,15 @@ static void MemLoadCont(int pid) {
         }
         g_mem_cont_loading.store(false);
     }).detach();
+}
+
+// 编辑窗口写入成功后自动刷新当前显示页（连续/分页）的数值与反汇编。
+static void MemRefreshAfterWrite(int pid) {
+    if (g_mem_cont_mode) {
+        MemLoadCont(pid);
+    } else if (!g_mem_last_page_addrs.empty()) {
+        MemLoadValuesForAddrs(pid, g_mem_last_page_addrs);
+    }
 }
 
 static void DrawMemContinuous(int pid) {
@@ -1021,13 +1098,23 @@ static void DrawMemEditWindow(int pid) {
                     if (WriteRemoteDword(pid, addr + i, w)) ok = true;
                     else { ok = false; break; }
                 }
-                std::lock_guard<std::mutex> lk(g_edit_mutex);
-                char msg[64];
-                snprintf(msg, sizeof(msg),
-                         ok ? u8"汇编写入成功 (%zu 字节)"
-                            : u8"写入失败 (目标不可写?)",
-                         bytes.size());
-                g_edit_result = msg;
+                {
+                    std::lock_guard<std::mutex> lk(g_edit_mutex);
+                    char msg[64];
+                    snprintf(msg, sizeof(msg),
+                             ok ? u8"汇编写入成功 (%zu 字节)"
+                                : u8"写入失败 (目标不可写?)",
+                             bytes.size());
+                    g_edit_result = msg;
+                }
+                if (ok) {
+                    // 写入成功：自动刷新内存页数值并回读当前值。
+                    MemRefreshAfterWrite(pid);
+                    uint32_t nv = 0;
+                    if (ReadRemoteDword(pid, addr, nv))
+                        snprintf(g_edit_value, sizeof(g_edit_value),
+                                 "%u", nv);
+                }
                 g_edit_writing.store(false);
             }).detach();
         } else {
@@ -1041,8 +1128,14 @@ static void DrawMemEditWindow(int pid) {
             }
             std::thread([pid, addr, v] {
                 bool ok = WriteRemoteDword(pid, addr, v);
-                std::lock_guard<std::mutex> lk(g_edit_mutex);
-                g_edit_result = ok ? "写入成功" : "写入失败 (目标不可写?)";
+                {
+                    std::lock_guard<std::mutex> lk(g_edit_mutex);
+                    g_edit_result = ok ? "写入成功" : "写入失败 (目标不可写?)";
+                }
+                if (ok) {
+                    // 写入成功：自动刷新内存页数值。
+                    MemRefreshAfterWrite(pid);
+                }
                 g_edit_writing.store(false);
             }).detach();
         }

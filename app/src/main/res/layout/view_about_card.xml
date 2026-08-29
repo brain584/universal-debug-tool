@@ -1,0 +1,110 @@
+<?xml version="1.0" encoding="utf-8"?>
+<merge xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools"
+    tools:parentTag="android.widget.LinearLayout"
+    tools:orientation="vertical">
+
+    <TextView
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:text="关于"
+        android:textColor="@color/text_primary"
+        android:textSize="@dimen/card_title_size"
+        android:textStyle="bold" />
+
+    <!-- 版本 -->
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="54dp"
+        android:gravity="center_vertical"
+        android:orientation="horizontal">
+
+        <ImageView
+            android:layout_width="@dimen/item_icon"
+            android:layout_height="@dimen/item_icon"
+            android:contentDescription="版本"
+            android:src="@drawable/ic_info"
+            android:tint="@color/icon_tint" />
+
+        <TextView
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_marginStart="16dp"
+            android:layout_weight="1"
+            android:text="版本"
+            android:textColor="@color/text_item"
+            android:textSize="16sp" />
+
+        <TextView
+            android:id="@+id/about_version"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="v1.0.0 (1000)"
+            android:textColor="@color/text_item"
+            android:textSize="15sp" />
+    </LinearLayout>
+
+    <!-- 架构 -->
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="54dp"
+        android:gravity="center_vertical"
+        android:orientation="horizontal">
+
+        <ImageView
+            android:layout_width="@dimen/item_icon"
+            android:layout_height="@dimen/item_icon"
+            android:contentDescription="架构"
+            android:src="@drawable/ic_cpu"
+            android:tint="@color/icon_tint" />
+
+        <TextView
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_marginStart="16dp"
+            android:layout_weight="1"
+            android:text="架构"
+            android:textColor="@color/text_item"
+            android:textSize="16sp" />
+
+        <TextView
+            android:id="@+id/about_arch"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="arm64-v8a"
+            android:textColor="@color/text_item"
+            android:textSize="15sp" />
+    </LinearLayout>
+
+    <!-- 运行时长 -->
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="54dp"
+        android:gravity="center_vertical"
+        android:orientation="horizontal">
+
+        <ImageView
+            android:layout_width="@dimen/item_icon"
+            android:layout_height="@dimen/item_icon"
+            android:contentDescription="运行时长"
+            android:src="@drawable/ic_clock"
+            android:tint="@color/icon_tint" />
+
+        <TextView
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_marginStart="16dp"
+            android:layout_weight="1"
+            android:text="运行时长"
+            android:textColor="@color/text_item"
+            android:textSize="16sp" />
+
+        <TextView
+            android:id="@+id/about_runtime"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="00:00:00"
+            android:textColor="@color/text_item"
+            android:textSize="15sp" />
+    </LinearLayout>
+</merge>

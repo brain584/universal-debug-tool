@@ -445,7 +445,7 @@ static void RenderLoop() {
 // 并返回捕获的输出。必须在后台线程调用：
 // `su` + ptrace 注入可能耗时，
 // 绝不能阻塞渲染线程。
-std::string RunInjector(const std::string& pkg) {
+static std::string RunInjectorArgs(const std::string& args) {
     std::string inj, agent;
     {
         std::lock_guard<std::mutex> lk(g_inject_mutex);
@@ -463,7 +463,7 @@ std::string RunInjector(const std::string& pkg) {
         if (prep) pclose(prep);
     }
 
-    std::string cmd = "su -c '" + inj + " -p " + pkg + " -l " + agent + "' 2>&1";
+    std::string cmd = "su -c '" + inj + " " + args + " -l " + agent + "' 2>&1";
     FILE* f = popen(cmd.c_str(), "r");
     if (!f) return "错误: 无法启动 su";
 
@@ -483,6 +483,16 @@ std::string RunInjector(const std::string& pkg) {
     if (out.size() > 2048)
         out = out.substr(out.size() - 2048);
     return out;
+}
+
+std::string RunInjector(const std::string& pkg) {
+    return RunInjectorArgs("-p " + pkg);
+}
+
+// 按 PID 注入：用于 native ELF 等非应用进程——没有包名可解析，
+// 注入器把 agent 复制到 /data/local/tmp 供目标读取。
+std::string RunInjectorPid(int pid) {
+    return RunInjectorArgs("-i " + std::to_string(pid));
 }
 
 // ── Root 内存辅助函数（imgui 内存查看器使用）──
@@ -787,7 +797,7 @@ JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM* vm, void* /*reserved*/) {
 // ── JNI——Surface 生命周期（由 Java UI 线程调用）──
 
 JNIEXPORT void JNICALL
-Java_com_example_unversaldebugtool_MainActivity_nativeSurfaceCreated(
+Java_com_Alive_Trace_MainActivity_nativeSurfaceCreated(
     JNIEnv* env, jobject /*this*/, jobject surface, jint width, jint height) {
 
     std::lock_guard<std::mutex> lk(g_SurfaceLock);
@@ -808,14 +818,14 @@ Java_com_example_unversaldebugtool_MainActivity_nativeSurfaceCreated(
 }
 
 JNIEXPORT void JNICALL
-Java_com_example_unversaldebugtool_MainActivity_nativeSurfaceChanged(
+Java_com_Alive_Trace_MainActivity_nativeSurfaceChanged(
     JNIEnv*, jobject, jint w, jint h) {
     g_SurfaceW.store(w);
     g_SurfaceH.store(h);
 }
 
 JNIEXPORT void JNICALL
-Java_com_example_unversaldebugtool_MainActivity_nativeSurfaceDestroyed(
+Java_com_Alive_Trace_MainActivity_nativeSurfaceDestroyed(
     JNIEnv*, jobject) {
 
     if (g_Running.load()) {
@@ -827,7 +837,7 @@ Java_com_example_unversaldebugtool_MainActivity_nativeSurfaceDestroyed(
 // ── 渲染线程控制 ──
 
 JNIEXPORT void JNICALL
-Java_com_example_unversaldebugtool_MainActivity_nativeStartRender(
+Java_com_Alive_Trace_MainActivity_nativeStartRender(
     JNIEnv* env, jobject thiz) {
 
     std::lock_guard<std::mutex> lk(g_StateMutex);
@@ -861,7 +871,7 @@ Java_com_example_unversaldebugtool_MainActivity_nativeStartRender(
 }
 
 JNIEXPORT void JNICALL
-Java_com_example_unversaldebugtool_MainActivity_nativeStopRender(
+Java_com_Alive_Trace_MainActivity_nativeStopRender(
     JNIEnv*, jobject) {
 
     std::lock_guard<std::mutex> lk(g_StateMutex);
@@ -883,20 +893,20 @@ Java_com_example_unversaldebugtool_MainActivity_nativeStopRender(
 // ── 输入（由 Java UI 线程调用）──
 
 JNIEXPORT void JNICALL
-Java_com_example_unversaldebugtool_MainActivity_nativeTouchEvent(
+Java_com_Alive_Trace_MainActivity_nativeTouchEvent(
     JNIEnv*, jobject, jint action, jfloat x, jfloat y, jint pid) {
     EnqueueTouch(action, x, y, pid);
 }
 
 JNIEXPORT void JNICALL
-Java_com_example_unversaldebugtool_MainActivity_nativeKeyEvent(
+Java_com_Alive_Trace_MainActivity_nativeKeyEvent(
     JNIEnv*, jobject, jint keyCode, jint action, jint unicode) {
     EnqueueKey(keyCode, action, unicode);
 }
 
 // ── 悬浮窗口原点 / 缩放（由 Java UI 线程调用）──
 JNIEXPORT void JNICALL
-Java_com_example_unversaldebugtool_MainActivity_nativeSetSurfaceOrigin(
+Java_com_Alive_Trace_MainActivity_nativeSetSurfaceOrigin(
     JNIEnv*, jobject, jfloat x, jfloat y, jfloat viewW, jfloat viewH,
     jfloat screenW, jfloat screenH) {
     g_SurfaceOriginX.store(x);
@@ -911,7 +921,7 @@ Java_com_example_unversaldebugtool_MainActivity_nativeSetSurfaceOrigin(
 // 这样弹窗保持窗口全屏时主窗口仍可拖动）
 // 。
 JNIEXPORT void JNICALL
-Java_com_example_unversaldebugtool_MainActivity_nativeSetPanelOrigin(
+Java_com_Alive_Trace_MainActivity_nativeSetPanelOrigin(
     JNIEnv*, jobject, jfloat x, jfloat y) {
     g_panel_x.store(x);
     g_panel_y.store(y);
@@ -920,7 +930,7 @@ Java_com_example_unversaldebugtool_MainActivity_nativeSetPanelOrigin(
 // 注入路径（从 assets 解压的注入器可执行文件 + APK 中
 // 打包的 agent .so）。
 JNIEXPORT void JNICALL
-Java_com_example_unversaldebugtool_MainActivity_nativeSetInjectorInfo(
+Java_com_Alive_Trace_MainActivity_nativeSetInjectorInfo(
     JNIEnv* env, jobject, jstring injectorPath, jstring agentPath) {
     const char* ip = injectorPath ? env->GetStringUTFChars(injectorPath, nullptr) : nullptr;
     const char* ap = agentPath ? env->GetStringUTFChars(agentPath, nullptr) : nullptr;
@@ -935,7 +945,7 @@ Java_com_example_unversaldebugtool_MainActivity_nativeSetInjectorInfo(
 
 // 配置文件目录（App 私有 files 目录，由 Java 传入）。
 JNIEXPORT void JNICALL
-Java_com_example_unversaldebugtool_MainActivity_nativeSetConfigDir(
+Java_com_Alive_Trace_MainActivity_nativeSetConfigDir(
     JNIEnv* env, jobject, jstring dir) {
     const char* d = dir ? env->GetStringUTFChars(dir, nullptr) : nullptr;
     g_config_dir = d ? d : "";
@@ -945,13 +955,13 @@ Java_com_example_unversaldebugtool_MainActivity_nativeSetConfigDir(
 // ── 状态查询（任意线程调用，无锁）──
 
 JNIEXPORT jboolean JNICALL
-Java_com_example_unversaldebugtool_MainActivity_nativeWantKeyboard(
+Java_com_Alive_Trace_MainActivity_nativeWantKeyboard(
     JNIEnv*, jobject) {
     return g_WantKeyboard.load() ? JNI_TRUE : JNI_FALSE;
 }
 
 JNIEXPORT jboolean JNICALL
-Java_com_example_unversaldebugtool_MainActivity_nativeWantCaptureMouse(
+Java_com_Alive_Trace_MainActivity_nativeWantCaptureMouse(
     JNIEnv*, jobject) {
     return g_WantCaptureMouse.load() ? JNI_TRUE : JNI_FALSE;
 }
@@ -959,7 +969,7 @@ Java_com_example_unversaldebugtool_MainActivity_nativeWantCaptureMouse(
 // 返回面板窗口在屏幕坐标下的目标边界。应用把
 // 单个悬浮窗口的位置 / 尺寸精确设置为该矩形。
 JNIEXPORT void JNICALL
-Java_com_example_unversaldebugtool_MainActivity_nativeGetPanelRect(
+Java_com_Alive_Trace_MainActivity_nativeGetPanelRect(
     JNIEnv* env, jobject, jfloatArray rect) {
     jfloat* arr = env->GetFloatArrayElements(rect, nullptr);
     if (!arr) return;
@@ -1010,7 +1020,7 @@ Java_com_example_unversaldebugtool_MainActivity_nativeGetPanelRect(
 }
 
 JNIEXPORT jboolean JNICALL
-Java_com_example_unversaldebugtool_MainActivity_nativeIsPointInWindow(
+Java_com_Alive_Trace_MainActivity_nativeIsPointInWindow(
     JNIEnv*, jobject, jfloat x, jfloat y) {
     return IsPointInImGuiWindow(x, y) ? JNI_TRUE : JNI_FALSE;
 }
@@ -1018,7 +1028,7 @@ Java_com_example_unversaldebugtool_MainActivity_nativeIsPointInWindow(
 // 当点在窗口标题栏上（拖动会移动整个
 // 悬浮窗口）或窗口已收起（整个胶囊可拖动）时返回 true。
 JNIEXPORT jboolean JNICALL
-Java_com_example_unversaldebugtool_MainActivity_nativeIsOnTitleBar(
+Java_com_Alive_Trace_MainActivity_nativeIsOnTitleBar(
     JNIEnv*, jobject, jfloat x, jfloat y) {
     if (!g_UiState) return JNI_FALSE;
     // 收起时胶囊必须不可拖动：移动窗口会
@@ -1035,13 +1045,13 @@ Java_com_example_unversaldebugtool_MainActivity_nativeIsOnTitleBar(
 }
 
 JNIEXPORT jboolean JNICALL
-Java_com_example_unversaldebugtool_MainActivity_nativeIsCollapsed(
+Java_com_Alive_Trace_MainActivity_nativeIsCollapsed(
     JNIEnv*, jobject) {
     return (g_UiState && g_UiState->collapsed) ? JNI_TRUE : JNI_FALSE;
 }
 
 JNIEXPORT jboolean JNICALL
-Java_com_example_unversaldebugtool_MainActivity_nativeIsOverlayExpanded(
+Java_com_Alive_Trace_MainActivity_nativeIsOverlayExpanded(
     JNIEnv*, jobject) {
     return g_overlay_expanded.load() ? JNI_TRUE : JNI_FALSE;
 }
@@ -1050,7 +1060,7 @@ Java_com_example_unversaldebugtool_MainActivity_nativeIsOverlayExpanded(
 // 这样展开不依赖 ImGui 的悬停 / 点击检测，
 // 也不依赖坐标映射的精确性）。
 JNIEXPORT void JNICALL
-Java_com_example_unversaldebugtool_MainActivity_nativeExpand(
+Java_com_Alive_Trace_MainActivity_nativeExpand(
     JNIEnv*, jobject) {
     if (g_UiState) {
         g_UiState->collapsed = false;
@@ -1058,7 +1068,7 @@ Java_com_example_unversaldebugtool_MainActivity_nativeExpand(
 }
 
 JNIEXPORT jboolean JNICALL
-Java_com_example_unversaldebugtool_MainActivity_nativeIsRunning(
+Java_com_Alive_Trace_MainActivity_nativeIsRunning(
     JNIEnv*, jobject) {
     return g_Running.load() ? JNI_TRUE : JNI_FALSE;
 }

@@ -7,17 +7,17 @@ plugins {
 }
 
 android {
-    namespace = "com.example.unversaldebugtool"
+    namespace = "com.Alive.Trace"
     compileSdk {
         version = release(36)
     }
 
     defaultConfig {
-        applicationId = "com.example.unversaldebugtool"
+        applicationId = "com.Alive.Trace"
         minSdk = 24
         targetSdk = 36
-        versionCode = 1
-        versionName = "1.0"
+        versionCode = 1000
+        versionName = "1.0.0"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         ndk {

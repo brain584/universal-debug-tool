@@ -1,0 +1,102 @@
+<?xml version="1.0" encoding="utf-8"?>
+<merge xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools"
+    tools:parentTag="android.widget.LinearLayout"
+    tools:orientation="vertical">
+
+    <TextView
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:text="权限状态"
+        android:textColor="@color/text_primary"
+        android:textSize="@dimen/card_title_size"
+        android:textStyle="bold" />
+
+    <!-- Root 权限 -->
+    <LinearLayout
+        android:id="@+id/perm_root_row"
+        android:layout_width="match_parent"
+        android:layout_height="@dimen/item_height"
+        android:background="?attr/selectableItemBackground"
+        android:gravity="center_vertical"
+        android:orientation="horizontal">
+
+        <ImageView
+            android:layout_width="@dimen/item_icon"
+            android:layout_height="@dimen/item_icon"
+            android:contentDescription="Root 权限"
+            android:src="@drawable/ic_shield"
+            android:tint="@color/icon_tint" />
+
+        <TextView
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_marginStart="16dp"
+            android:layout_weight="1"
+            android:text="Root 权限"
+            android:textColor="@color/text_item"
+            android:textSize="16sp" />
+
+        <ImageView
+            android:id="@+id/perm_root_check"
+            android:layout_width="20dp"
+            android:layout_height="20dp"
+            android:contentDescription="Root 状态"
+            android:src="@drawable/ic_check_circle"
+            android:tint="@color/accent_dim" />
+
+        <TextView
+            android:id="@+id/perm_root_state"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginStart="8dp"
+            android:minWidth="52dp"
+            android:text="检测中…"
+            android:textColor="@color/text_dim"
+            android:textSize="15sp" />
+    </LinearLayout>
+
+    <!-- 悬浮窗权限 -->
+    <LinearLayout
+        android:id="@+id/perm_overlay_row"
+        android:layout_width="match_parent"
+        android:layout_height="@dimen/item_height"
+        android:background="?attr/selectableItemBackground"
+        android:gravity="center_vertical"
+        android:orientation="horizontal">
+
+        <ImageView
+            android:layout_width="@dimen/item_icon"
+            android:layout_height="@dimen/item_icon"
+            android:contentDescription="悬浮窗权限"
+            android:src="@drawable/ic_terminal"
+            android:tint="@color/icon_tint" />
+
+        <TextView
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_marginStart="16dp"
+            android:layout_weight="1"
+            android:text="悬浮窗权限"
+            android:textColor="@color/text_item"
+            android:textSize="16sp" />
+
+        <ImageView
+            android:id="@+id/perm_overlay_check"
+            android:layout_width="20dp"
+            android:layout_height="20dp"
+            android:contentDescription="悬浮窗状态"
+            android:src="@drawable/ic_check_circle"
+            android:tint="@color/accent_dim" />
+
+        <TextView
+            android:id="@+id/perm_overlay_state"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginStart="8dp"
+            android:minWidth="52dp"
+            android:text="检测中…"
+            android:textColor="@color/text_dim"
+            android:textSize="15sp" />
+    </LinearLayout>
+</merge>

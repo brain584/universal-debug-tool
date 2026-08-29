@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 选择进程按钮：透明底 + 绿色描边 + 点击 ripple。 -->
+<ripple xmlns:android="http://schemas.android.com/apk/res/android"
+    android:color="#336ED957">
+    <item>
+        <shape>
+            <solid android:color="#00000000" />
+            <stroke android:width="1.5dp" android:color="@color/accent" />
+            <corners android:radius="@dimen/outline_btn_radius" />
+        </shape>
+    </item>
+</ripple>

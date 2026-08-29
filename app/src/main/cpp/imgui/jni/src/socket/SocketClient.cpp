@@ -233,8 +233,8 @@ int SocketClient::SpawnRelay(int& read_fd, int& write_fd) {
     // 注入器可执行文件（通过 su 以 root 运行）连接到 agent socket，
     // 并在 socket 与 stdin/stdout 之间转发字节。尝试常见应用路径。
     static const char* kRelayPaths[] = {
-        "/data/user/0/com.example.unversaldebugtool/files/injector",
-        "/data/data/com.example.unversaldebugtool/files/injector",
+        "/data/user/0/com.Alive.Trace/files/injector",
+        "/data/data/com.Alive.Trace/files/injector",
         nullptr,
     };
     for (int i = 0; kRelayPaths[i]; ++i) {

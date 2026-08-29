@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- 启动界面配色属性：跟随 Theme.UnversalDebugTool.* 变体切换 -->
+    <attr name="accentColor" format="color" />
+    <attr name="accentDimColor" format="color" />
+</resources>
