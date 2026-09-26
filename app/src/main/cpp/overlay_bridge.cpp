@@ -7,7 +7,9 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cerrno>
 #include <chrono>
+#include <csignal>
 #include <cstring>
 #include <mutex>
 #include <string>
@@ -189,6 +191,16 @@ Java_com_Alive_Trace_overlay_NativeBridge_killProcess(JNIEnv* env, jobject,
     return ToJString(env, RunSuCommand("kill -9 " + std::to_string(pid)));
 }
 
+// 目标进程是否仍存活。使用 kill(pid, 0)：普通应用对其他 uid 的进程
+// 会得到 EPERM（表示进程存在），仅 ESRCH 表示已退出；无需 su。
+JNIEXPORT jboolean JNICALL
+Java_com_Alive_Trace_overlay_NativeBridge_procAlive(JNIEnv*, jobject,
+                                                    jint pid) {
+    if (pid <= 0) return JNI_FALSE;
+    if (kill((pid_t)pid, 0) == 0) return JNI_TRUE;
+    return errno == EPERM ? JNI_TRUE : JNI_FALSE;
+}
+
 JNIEXPORT jstring JNICALL
 Java_com_Alive_Trace_overlay_NativeBridge_suCmd(JNIEnv* env, jobject,
                                                 jstring cmd) {
@@ -297,13 +309,37 @@ JNIEXPORT jbyteArray JNICALL
 Java_com_Alive_Trace_overlay_NativeBridge_memRead(JNIEnv* env, jobject,
                                                   jint pid, jlong addr,
                                                   jint len) {
-    if (len <= 0) return env->NewByteArray(0);
+    if (len <= 0) return nullptr;
     std::vector<uint8_t> buf((size_t)len, 0);
-    ReadRemoteBytes(pid, (uintptr_t)addr, buf.data(), (size_t)len);
+    if (!ReadRemoteBytes(pid, (uintptr_t)addr, buf.data(), (size_t)len))
+        return nullptr;
     jbyteArray arr = env->NewByteArray(len);
     env->SetByteArrayRegion(arr, 0, len,
                             reinterpret_cast<const jbyte*>(buf.data()));
     return arr;
+}
+
+// 目标进程 maps 中第一块可读区域起点，供内存页默认定位。
+JNIEXPORT jlong JNICALL
+Java_com_Alive_Trace_overlay_NativeBridge_memFirstAddress(JNIEnv*, jobject,
+                                                          jint pid) {
+    std::string maps = ReadRemoteMaps(pid);
+    if (maps.empty()) return 0;
+    size_t pos = 0;
+    while (pos < maps.size()) {
+        size_t e = maps.find('\n', pos);
+        if (e == std::string::npos) e = maps.size();
+        std::string line = maps.substr(pos, e - pos);
+        pos = e + 1;
+        if (line.size() < 20) continue;
+        unsigned long long a = 0, b = 0;
+        if (sscanf(line.c_str(), "%llx-%llx", &a, &b) != 2 || b <= a)
+            continue;
+        // 权限段形如 "r-xp"，仅取可读区域。
+        if (line.find(" r") == std::string::npos) continue;
+        return (jlong)a;
+    }
+    return 0;
 }
 
 // ── 搜索状态 ────────────────────────────────────────────────────────
@@ -692,39 +728,189 @@ Java_com_Alive_Trace_overlay_NativeBridge_searchRefine(JNIEnv* env, jobject,
 
 } // extern "C"
 
-// ── 硬件断点服务（复用 ImGui 侧 g_bp 单例，两端共享状态）──────────
+// ── 内存页行渲染复用（与 ImGui 侧 MemLoadCont 相同逻辑）──────────
+#include "Disasm.h"
+#include "AsmWrite.h"
 #include "bp/BpService.h"
 extern BpService g_bp;
 
+namespace {
+
+struct MemRegionSimple {
+    uintptr_t   start = 0;
+    uintptr_t   end = 0;
+    std::string type;
+    std::string path;   // maps 行末尾的路径/模块名（可能为空）
+};
+
+// 把 ClassifyMemType 的长名映射为 ImGui/主流工具使用的短代号。
+std::string ShortMemType(const std::string& t) {
+    if (t == "cpp heap")   return "Ch";
+    if (t == "cpp alloc")  return "Ca";
+    if (t == "bss")        return "Cb";
+    if (t == "anonymous")  return "A";
+    if (t == "stack")      return "S";
+    if (t == "ashmem")     return "As";
+    if (t == "video")      return "V";
+    if (t == "bad")        return "B";
+    if (t == "code system")return "Xs";
+    if (t == "java")       return "J";
+    if (t == "cpp data")   return "Cd";
+    if (t == "code app")   return "Xa";
+    return "O";
+}
+
+// 取 maps 路径的模块基名（去掉目录与末尾空格）。
+std::string ModuleBaseName(const std::string& path) {
+    size_t b = path.find_last_of('/');
+    std::string name = (b == std::string::npos) ? path : path.substr(b + 1);
+    while (!name.empty() && (name.back() == ' ' || name.back() == '\r'))
+        name.pop_back();
+    return name;
+}
+
+// 解码某行地址处的第一条 ARM64 指令；带 LDR(literal) 的 PC 相对改写，
+// 与 ImGui 侧 DisasmFirstLine 完全一致。
+std::string DisasmFirstLineArm64(const uint8_t* bytes, size_t n) {
+    std::vector<udt_disasm::Insn> insns;
+    if (!udt_disasm::Disassemble(udt_disasm::Arch::Arm64, bytes, n, 0, 1,
+                                 insns) || insns.empty())
+        return "";
+    std::string s = insns[0].mnemonic;
+    if (!insns[0].op_str.empty()) s += " " + insns[0].op_str;
+    if (insns[0].size >= 4) {
+        uint32_t w = (uint32_t)insns[0].bytes[0] |
+                     ((uint32_t)insns[0].bytes[1] << 8) |
+                     ((uint32_t)insns[0].bytes[2] << 16) |
+                     ((uint32_t)insns[0].bytes[3] << 24);
+        uint32_t fam = w & 0x3F000000u;
+        if (fam == 0x18000000u || fam == 0x1C000000u) {
+            int64_t imm19 = (int64_t)(w >> 5) & 0x7FFFF;
+            if (imm19 & 0x40000) imm19 -= 0x80000;
+            int64_t off = imm19 * 4;
+            size_t comma = insns[0].op_str.find(',');
+            if (comma != std::string::npos) {
+                std::string first = insns[0].op_str.substr(0, comma);
+                size_t b = first.find_first_not_of(" \t");
+                if (b != std::string::npos) {
+                    first = first.substr(
+                        b, first.find_last_not_of(" \t") - b + 1);
+                    char buf[48];
+                    if (off < 0)
+                        snprintf(buf, sizeof(buf), "[pc, #-0x%llx]",
+                                 (unsigned long long)(-off));
+                    else
+                        snprintf(buf, sizeof(buf), "[pc, #0x%llx]",
+                                 (unsigned long long)off);
+                    s = insns[0].mnemonic + " " + first + ", " + buf;
+                }
+            }
+        }
+    }
+    return s;
+}
+
+std::vector<MemRegionSimple> ParseMemRegions(int pid) {
+    std::vector<MemRegionSimple> out;
+    std::string maps = ReadRemoteMaps(pid);
+    size_t pos = 0;
+    while (pos < maps.size()) {
+        size_t e = maps.find('\n', pos);
+        if (e == std::string::npos) e = maps.size();
+        std::string line = maps.substr(pos, e - pos);
+        pos = e + 1;
+        if (line.size() < 20) continue;
+        unsigned long long a = 0, b = 0, off = 0, ino = 0;
+        char perms[8] = {0};
+        char dev[32] = {0};
+        char path[512] = {0};
+        int n = sscanf(line.c_str(),
+                       "%llx-%llx %7s %llx %31s %llu %511[^\n]",
+                       &a, &b, perms, &off, dev, &ino, path);
+        if (n < 6) continue;
+        MemRegionSimple r;
+        r.start = (uintptr_t)a;
+        r.end = (uintptr_t)b;
+        r.type = ClassifyMemType(perms, n >= 7 ? path : "");
+        r.path = n >= 7 ? path : "";
+        out.push_back(std::move(r));
+    }
+    return out;
+}
+
+// 带 TTL 的 maps 缓存：断点命中解析 PC 所属区域/模块时避免每次
+// 都 fork su 读取 maps。
+std::vector<MemRegionSimple> CachedMemRegions(int pid) {
+    static std::mutex    mtx;
+    static int           cached_pid = 0;
+    static int64_t       cached_at  = 0;
+    static std::vector<MemRegionSimple> cached;
+    std::lock_guard<std::mutex> lk(mtx);
+    int64_t now = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+    if (pid != cached_pid || now - cached_at > 3000 || cached.empty()) {
+        cached = ParseMemRegions(pid);
+        cached_pid = pid;
+        cached_at = now;
+    }
+    return cached;
+}
+
+} // namespace
+
+extern "C" {
+
+// ── 硬件断点服务（复用 ImGui 侧 g_bp 单例，两端共享状态）──────────
 JNIEXPORT void JNICALL
 Java_com_Alive_Trace_overlay_NativeBridge_bpStart(JNIEnv*, jobject, jint pid) {
-    g_bp.Start(pid);
+    try {
+        g_bp.Start(pid);
+    } catch (const std::exception& ex) {
+        OLOG("bpStart exception: %s", ex.what());
+        g_bp.ReportError(std::string("错误: 启动异常 ") + ex.what());
+    }
 }
 
 JNIEXPORT void JNICALL
 Java_com_Alive_Trace_overlay_NativeBridge_bpStop(JNIEnv*, jobject) {
-    g_bp.Stop();
+    try {
+        g_bp.Stop();
+    } catch (const std::exception& ex) {
+        OLOG("bpStop exception: %s", ex.what());
+    }
 }
 
 JNIEXPORT jboolean JNICALL
 Java_com_Alive_Trace_overlay_NativeBridge_bpIsRunning(JNIEnv*, jobject) {
-    return g_bp.IsRunning() ? JNI_TRUE : JNI_FALSE;
+    try {
+        return g_bp.IsRunning() ? JNI_TRUE : JNI_FALSE;
+    } catch (...) {
+        return JNI_FALSE;
+    }
 }
 
 JNIEXPORT jstring JNICALL
 Java_com_Alive_Trace_overlay_NativeBridge_bpStatus(JNIEnv* env, jobject) {
-    return ToJString(env, g_bp.Status());
+    try {
+        return ToJString(env, g_bp.Status());
+    } catch (...) {
+        return ToJString(env, "状态读取异常");
+    }
 }
 
 JNIEXPORT void JNICALL
 Java_com_Alive_Trace_overlay_NativeBridge_bpSet(JNIEnv* env, jobject, jlong addr,
                                                 jstring type, jint len) {
-    const char* t = type ? env->GetStringUTFChars(type, nullptr) : "x";
-    char line[96];
-    snprintf(line, sizeof(line), "set %llx %s %d",
-             (unsigned long long)addr, t ? t : "x", len);
-    if (t) env->ReleaseStringUTFChars(type, t);
-    g_bp.Send(line);
+    try {
+        const char* t = type ? env->GetStringUTFChars(type, nullptr) : "x";
+        char line[96];
+        snprintf(line, sizeof(line), "set %llx %s %d",
+                 (unsigned long long)addr, t ? t : "x", len);
+        if (t) env->ReleaseStringUTFChars(type, t);
+        g_bp.Send(line);
+    } catch (const std::exception& ex) {
+        OLOG("bpSet exception: %s", ex.what());
+    }
 }
 
 JNIEXPORT void JNICALL
@@ -743,19 +929,58 @@ Java_com_Alive_Trace_overlay_NativeBridge_bpClearHits(JNIEnv*, jobject) {
 JNIEXPORT jstring JNICALL
 Java_com_Alive_Trace_overlay_NativeBridge_bpHits(JNIEnv* env, jobject,
                                                  jint maxN) {
-    auto hits = g_bp.Hits();
-    std::string out;
-    int n = 0;
-    for (auto it = hits.rbegin(); it != hits.rend() && n < maxN; ++it, ++n) {
-        char line[512];
-        snprintf(line, sizeof(line), "%llx|%d|%llx|%s",
-                 (unsigned long long)it->pc, it->tid,
-                 (unsigned long long)it->addr,
-                 it->disasm.c_str());
-        out += line;
-        out += '\n';
+    try {
+        auto hits = g_bp.Hits();
+        int tpid = g_bp.TargetPid();
+        std::vector<MemRegionSimple> regions;
+        if (tpid > 0) regions = CachedMemRegions(tpid);
+        std::string out;
+        int n = 0;
+        for (auto it = hits.rbegin(); it != hits.rend() && n < maxN; ++it, ++n) {
+            std::string stack;
+            for (size_t k = 0; k < it->stack.size(); ++k) {
+                if (k) stack += '>';
+                char sb[24];
+                snprintf(sb, sizeof(sb), "0x%llx",
+                         (unsigned long long)it->stack[k]);
+                stack += sb;
+            }
+            std::string regs;
+            for (size_t k = 0; k < it->regs.size(); ++k) {
+                if (k) regs += ',';
+                char rb[48];
+                snprintf(rb, sizeof(rb), "%s=0x%llx",
+                         it->regs[k].name.c_str(),
+                         (unsigned long long)it->regs[k].value);
+                regs += rb;
+            }
+            // 解析 PC 所属内存区域与模块（供 UI 显示 "Xa libxxx.so"）。
+            std::string region, module;
+            for (const auto& r : regions) {
+                if (it->pc >= r.start && it->pc < r.end) {
+                    region = ShortMemType(r.type);
+                    module = ModuleBaseName(r.path);
+                    break;
+                }
+            }
+            char line[4096];
+            snprintf(line, sizeof(line),
+                     "%llx|%d|%llx|%s|%llx|%s|%s|%d|%s|%s|%d|%d",
+                     (unsigned long long)it->pc, it->tid,
+                     (unsigned long long)it->addr,
+                     it->disasm.c_str(),
+                     (unsigned long long)it->sp,
+                     stack.c_str(), regs.c_str(),
+                     it->counter, region.c_str(), module.c_str(),
+                     it->bp_type, it->bp_len);
+            out += line;
+            out += '\n';
+        }
+        return ToJString(env, out);
+    } catch (const std::exception& ex) {
+        OLOG("bpHits exception: %s", ex.what());
+        return ToJString(env, "");
     }
-    return ToJString(env, out);
 }
 
 // agent 的 lua 日志（分配等脚本通过 print 回传结果）。
@@ -764,9 +989,32 @@ Java_com_Alive_Trace_overlay_NativeBridge_socketLuaLogs(JNIEnv* env, jobject) {
     return ToJString(env, g_ov_socket.SendCommand("lua_logs 0", 2000));
 }
 
+// 目标进程内 mmap（agent 侧 alloc 命令），返回 "ALLOC 0x..." 或错误。
+JNIEXPORT jstring JNICALL
+Java_com_Alive_Trace_overlay_NativeBridge_socketAlloc(JNIEnv* env, jobject,
+                                                      jlong size,
+                                                      jstring prot) {
+    const char* p = prot ? env->GetStringUTFChars(prot, nullptr) : "rw";
+    int bits = 0;
+    for (const char* c = p ? p : ""; *c; ++c) {
+        if (*c == 'r') bits |= 1;
+        else if (*c == 'w') bits |= 2;
+        else if (*c == 'x') bits |= 4;
+    }
+    if (p) env->ReleaseStringUTFChars(prot, p);
+    if (bits == 0) bits = 3;
+    std::string cmd = "alloc " + std::to_string((unsigned long long)size) +
+                      " " + std::to_string(bits);
+    return ToJString(env, g_ov_socket.SendCommand(cmd, 10000));
+}
+
+// 目标进程已加载库列表（agent 侧 modules 命令）。
+JNIEXPORT jstring JNICALL
+Java_com_Alive_Trace_overlay_NativeBridge_socketModules(JNIEnv* env, jobject) {
+    return ToJString(env, g_ov_socket.SendCommand("modules", 5000));
+}
+
 // ── 反汇编 / 汇编写入（capstone + asmjit，复用 ImGui 侧封装）──────
-#include "Disasm.h"
-#include "AsmWrite.h"
 
 // bytes → "助记符 操作数"（单条，失败返回空）。
 JNIEXPORT jstring JNICALL
@@ -777,13 +1025,40 @@ Java_com_Alive_Trace_overlay_NativeBridge_memDisasm(JNIEnv* env, jobject,
     std::vector<uint8_t> buf((size_t)n);
     env->GetByteArrayRegion(bytes, 0, n,
                             reinterpret_cast<jbyte*>(buf.data()));
-    std::vector<udt_disasm::Insn> insns;
-    if (!udt_disasm::Disassemble(udt_disasm::Arch::Arm64, buf.data(),
-                                 buf.size(), 0, 1, insns) || insns.empty())
-        return ToJString(env, "");
-    std::string s = insns[0].mnemonic;
-    if (!insns[0].op_str.empty()) s += " " + insns[0].op_str;
-    return ToJString(env, s);
+    return ToJString(env, DisasmFirstLineArm64(buf.data(), buf.size()));
+}
+
+// 内存页整页读取（复用 ImGui MemLoadCont 的逐行逻辑）：
+// 每行输出 "addr|ok|hex8|disasm|type"。
+JNIEXPORT jstring JNICALL
+Java_com_Alive_Trace_overlay_NativeBridge_memPage(JNIEnv* env, jobject,
+                                                  jint pid, jlong base,
+                                                  jint rows) {
+    if (rows <= 0 || rows > 64) return ToJString(env, "");
+    auto regions = ParseMemRegions(pid);
+    std::string out;
+    for (int i = 0; i < rows; ++i) {
+        uintptr_t a = (uintptr_t)base + (uintptr_t)i * 4;
+        uint8_t b[16] = {0};
+        bool ok = ReadRemoteBytes(pid, a, b, sizeof(b));
+        if (!ok) {
+            // 行尾跨到不可读页时退化为只读 4 字节（值 + 单条指令仍可显示）。
+            ok = ReadRemoteBytes(pid, a, b, 4);
+        }
+        std::string disasm = ok ? DisasmFirstLineArm64(b, sizeof(b)) : "";
+        std::string type = "other";
+        for (const auto& r : regions) {
+            if (a >= r.start && a < r.end) { type = r.type; break; }
+        }
+        char line[1024];
+        snprintf(line, sizeof(line), "%llx|%d|%08X|%s|%s\n",
+                 (unsigned long long)a, ok ? 1 : 0,
+                 ok ? (unsigned int)(b[0] | (b[1] << 8) |
+                         (b[2] << 16) | ((uint32_t)b[3] << 24)) : 0u,
+                 disasm.c_str(), type.c_str());
+        out += line;
+    }
+    return ToJString(env, out);
 }
 
 // 文本汇编 → 写入目标地址（~A8 语法，与 ImGui 侧一致）。
@@ -813,3 +1088,5 @@ Java_com_Alive_Trace_overlay_NativeBridge_asmWrite(JNIEnv* env, jobject,
     snprintf(msg, sizeof(msg), "OK %zu 字节", bytes.size());
     return ToJString(env, msg);
 }
+
+} // extern "C"

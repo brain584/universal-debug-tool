@@ -9,8 +9,11 @@ object NativeBridge {
     external fun injectPkg(pkg: String): String
     external fun injectPid(pid: Int): String
     external fun killProcess(pid: Int): String
+    external fun procAlive(pid: Int): Boolean
     external fun suCmd(cmd: String): String
-    external fun memRead(pid: Int, addr: Long, len: Int): ByteArray
+    external fun memRead(pid: Int, addr: Long, len: Int): ByteArray?
+    external fun memFirstAddress(pid: Int): Long
+    external fun memPage(pid: Int, addr: Long, rows: Int): String
     external fun memWrite(pid: Int, addr: Long, data: ByteArray): Boolean
     external fun searchCount(): Int
     external fun searchStatus(): String
@@ -27,6 +30,8 @@ object NativeBridge {
     external fun socketIsConnected(): Boolean
     external fun socketStatus(): String
     external fun socketSendLua(script: String): String
+    external fun socketAlloc(size: Long, prot: String): String
+    external fun socketModules(): String
     external fun allocRemote(pid: Int, size: Long, prot: String): String
     external fun memDisasm(bytes: ByteArray): String
     external fun asmWrite(pid: Int, addr: Long, text: String): String
@@ -71,12 +76,15 @@ object MT {
     /** 搜索类型选择顺序（D/F 常用在前）。 */
     val all = intArrayOf(DWORD, FLOAT, QWORD, WORD, BYTE, DOUBLE)
 
+    /** 地址统一显示格式（与内存页一致：大写、至少 8 位、无 0x）。 */
+    fun addr(a: Long): String = "%08X".format(a)
+
     /** raw 按类型格式化为显示值。 */
     fun fmt(t: Int, raw: Long): String = when (t) {
         BYTE -> raw.toByte().toString()
         WORD -> raw.toShort().toString()
         DWORD -> raw.toInt().toString()
-        QWORD -> raw.toString()
+        QWORD -> java.lang.Long.toUnsignedString(raw)
         FLOAT -> floatFromBits(raw.toInt()).toString()
         else -> doubleFromBits(raw).toString()
     }
@@ -95,7 +103,7 @@ object MT {
                     BYTE -> bb.put(text.trim().toByte())
                     WORD -> bb.putShort(text.trim().toShort())
                     DWORD -> bb.putInt(text.trim().toInt())
-                    QWORD -> bb.putLong(text.trim().toLong())
+                    QWORD -> bb.putLong(parseUnsigned(text))
                     FLOAT -> bb.putFloat(text.trim().toFloat())
                     else -> bb.putDouble(text.trim().toDouble())
                 }
@@ -109,13 +117,34 @@ object MT {
         null
     }
 
+    /**
+     * 十六进制文本 → Long，按无符号解析（最高位为 1 的 64 位值也能正确
+     * 读入；Kotlin 的 toLongOrNull(16) 对有符号溢出会返回 null → 被当成 0，
+     * 这是断点寄存器/搜索值显示为 0 的元凶之一）。
+     */
+    fun parseHex(s: String): Long? = try {
+        val t = s.trim().removePrefix("0x").removePrefix("0X").ifEmpty { "0" }
+        java.lang.Long.parseUnsignedLong(t, 16)
+    } catch (_: Exception) {
+        null
+    }
+
+    /** 无符号十进制/0x 十六进制文本 → Long。 */
+    fun parseUnsigned(s: String): Long {
+        val t = s.trim()
+        return if (t.startsWith("0x") || t.startsWith("0X"))
+            java.lang.Long.parseUnsignedLong(t.substring(2), 16)
+        else
+            java.lang.Long.parseUnsignedLong(t)
+    }
+
     /** 显示值文本 → raw（long 存储）。非法返回 null。 */
     fun parse(t: Int, text: String): Long? = try {
         when (t) {
             BYTE -> text.trim().toByte().toLong()
             WORD -> text.trim().toShort().toLong()
             DWORD -> text.trim().toInt().toLong()
-            QWORD -> text.trim().toLong()
+            QWORD -> parseUnsigned(text)
             FLOAT -> text.trim().toFloat().toBits().toLong()
             else -> text.trim().toDouble().toBits()
         }
@@ -138,12 +167,14 @@ object Areas {
 }
 
 class SavedRow(val addr: Long, var type: Int, var label: String,
-               var valueText: String, var frozen: Boolean)
+               var valueText: String, var frozen: Boolean,
+               var name: String = "")   // 用户可自定义标记名
 
 /** 悬浮窗各页共享状态。 */
 object OState {
     @Volatile var pid = 0
     @Volatile var pname = "-"
+    @Volatile var pkg = ""
     val saved = mutableListOf<SavedRow>()
     var searchType = MT.DWORD
     val areas = mutableListOf(Areas.ALL)

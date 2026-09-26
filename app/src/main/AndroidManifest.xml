@@ -28,6 +28,14 @@
         <activity
             android:name=".AboutActivity"
             android:exported="false" />
+
+        <activity
+            android:name=".CopyActivity"
+            android:exported="false"
+            android:excludeFromRecents="true"
+            android:noHistory="true"
+            android:taskAffinity=""
+            android:theme="@style/Theme.ATrace.Transparent" />
     </application>
 
 </manifest>

@@ -5,10 +5,9 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 # 基础路径
-set(IMGUI_ROOT   ${CMAKE_CURRENT_SOURCE_DIR}/imgui)
-set(IMGUI_INC    ${IMGUI_ROOT}/jni/include)
-set(IMGUI_LIBDIR ${IMGUI_ROOT}/obj/local/${ANDROID_ABI})
-set(IMGUI_PREBUILT ${IMGUI_ROOT}/prebuilt/${ANDROID_ABI})
+set(CPP_ROOT     ${CMAKE_CURRENT_SOURCE_DIR})
+set(BACKEND_ROOT ${CPP_ROOT}/backend)
+set(BACKEND_SRC  ${BACKEND_ROOT}/jni/src)
 
 # Agent 注入载荷（注入到目标进程）
 # 会打包进 APK 作为 libagent.so，由应用注入到用户选择的进程。
@@ -24,20 +23,20 @@ add_library(agent SHARED
     agent/jni/xdl/xdl_util.c
 )
 target_include_directories(agent PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/agent/jni
-    ${CMAKE_CURRENT_SOURCE_DIR}/agent/jni/luajit/include
-    ${CMAKE_CURRENT_SOURCE_DIR}/agent/jni/Dobby
-    ${CMAKE_CURRENT_SOURCE_DIR}/agent/jni/memTool
-    ${CMAKE_CURRENT_SOURCE_DIR}/agent/jni/xdl
-    ${CMAKE_CURRENT_SOURCE_DIR}/agent/jni/lua
+    ${CPP_ROOT}/agent/jni
+    ${CPP_ROOT}/agent/jni/luajit/include
+    ${CPP_ROOT}/agent/jni/Dobby
+    ${CPP_ROOT}/agent/jni/memTool
+    ${CPP_ROOT}/agent/jni/xdl
+    ${CPP_ROOT}/agent/jni/lua
 )
 target_compile_definitions(agent PRIVATE
     LUAJIT_ENABLE_GC64
     LUAJIT_ENABLE_LUA52COMPAT
 )
 target_link_libraries(agent
-    ${CMAKE_CURRENT_SOURCE_DIR}/agent/jni/luajit/lib/${ANDROID_ABI}/libluajit.a
-    ${CMAKE_CURRENT_SOURCE_DIR}/agent/jni/Dobby/libdobby.a
+    ${CPP_ROOT}/agent/jni/luajit/lib/${ANDROID_ABI}/libluajit.a
+    ${CPP_ROOT}/agent/jni/Dobby/libdobby.a
     log
     dl
     m
@@ -45,71 +44,49 @@ target_link_libraries(agent
 )
 target_link_options(agent PRIVATE -static-libstdc++)
 
-# 共享库（JNI 桥 + Dynamic Island UI）
-# 编译 JNI 桥接层与用户 UI 源码，链接预编译的 AImGui 静态库进行渲染。
+# 共享库：JNI 后端 + 原生悬浮窗桥接 + 后端复用
+# （内存搜索 memorysearch / 断点 BpService / socket / 反汇编 Disasm / 汇编 AsmWrite）。
 add_library(unversaldebugtool SHARED
     native-lib.cpp
     overlay_bridge.cpp
-    # AImGui UI 层：Dynamic Island 侧边栏 + 各功能页
-    ${IMGUI_ROOT}/jni/src/ui/ui.cpp
-    ${IMGUI_ROOT}/jni/src/ui/main_ui.cpp
-    ${IMGUI_ROOT}/jni/src/socket/SocketClient.cpp
-    ${IMGUI_ROOT}/jni/src/bp/BpService.cpp
-    # MemorySearch：imgui 侧内存读写 / 搜索库（MIT，已去除 Keystone 依赖）
-    ${IMGUI_ROOT}/jni/memsearch/Mem.cpp
-    ${IMGUI_ROOT}/jni/memsearch/Membase.cpp
-    ${IMGUI_ROOT}/jni/memsearch/MemMmap.cpp
-    ${IMGUI_ROOT}/jni/memsearch/MemSu.cpp
-    ${IMGUI_ROOT}/jni/memsearch/Process.cpp
-    ${IMGUI_ROOT}/jni/memsearch/ProcIO.cpp
-    ${IMGUI_ROOT}/jni/memsearch/Search.cpp
-    ${IMGUI_ROOT}/jni/memsearch/FuzzySearch.cpp
+    ${BACKEND_SRC}/socket/SocketClient.cpp
+    ${BACKEND_SRC}/bp/BpService.cpp
+    # MemorySearch：内存读写 / 搜索库（MIT，已去除 Keystone 依赖）
+    ${BACKEND_ROOT}/jni/memsearch/Mem.cpp
+    ${BACKEND_ROOT}/jni/memsearch/Membase.cpp
+    ${BACKEND_ROOT}/jni/memsearch/MemMmap.cpp
+    ${BACKEND_ROOT}/jni/memsearch/MemSu.cpp
+    ${BACKEND_ROOT}/jni/memsearch/Process.cpp
+    ${BACKEND_ROOT}/jni/memsearch/ProcIO.cpp
+    ${BACKEND_ROOT}/jni/memsearch/Search.cpp
+    ${BACKEND_ROOT}/jni/memsearch/FuzzySearch.cpp
 )
 
 target_include_directories(unversaldebugtool PRIVATE
-    ${IMGUI_INC}
-    ${IMGUI_INC}/imgui
-    ${IMGUI_INC}/imgui/backends
-    ${IMGUI_INC}/ui
-    ${IMGUI_ROOT}/jni/src
-    ${IMGUI_ROOT}/jni/src/core
-    ${IMGUI_ROOT}/jni/src/platform
-    ${IMGUI_ROOT}/jni/src/ui
-    ${IMGUI_ROOT}/jni/src/socket
-    ${CMAKE_CURRENT_SOURCE_DIR}/imgui/jni/capstone/include
-    ${CMAKE_CURRENT_SOURCE_DIR}/imgui/jni/asmjit
-    ${IMGUI_ROOT}/jni/memsearch
+    ${BACKEND_SRC}
+    ${BACKEND_SRC}/ui
+    ${BACKEND_ROOT}/jni/memsearch
+    ${BACKEND_ROOT}/jni/capstone/include
+    ${BACKEND_ROOT}/jni/asmjit
 )
 
-# AsmJit：内存编辑器的 AArch64 文本汇编（imgui 侧）
+# AsmJit：内存编辑器的 AArch64 文本汇编
 file(GLOB ASMJIT_SOURCES
-    ${CMAKE_CURRENT_SOURCE_DIR}/imgui/jni/asmjit/asmjit/core/*.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/imgui/jni/asmjit/asmjit/support/*.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/imgui/jni/asmjit/asmjit/arm/*.cpp
+    ${BACKEND_ROOT}/jni/asmjit/asmjit/core/*.cpp
+    ${BACKEND_ROOT}/jni/asmjit/asmjit/support/*.cpp
+    ${BACKEND_ROOT}/jni/asmjit/asmjit/arm/*.cpp
 )
 target_sources(unversaldebugtool PRIVATE ${ASMJIT_SOURCES})
 
 target_compile_definitions(unversaldebugtool PRIVATE
-    SURFACE_LOG_ENABLE=0
-    IMGUI_DISABLE_OBSOLETE_FUNCTIONS
     ASMJIT_STATIC
     ASMJIT_NO_X86
 )
 
 target_link_libraries(unversaldebugtool
-    # 预编译的 AImGui 静态库：
-    #   libaimgui_core.a     - renderer_gl、bloom_gl、font、renderer_factory
-    #   libaimgui_platform.a - TouchHelperA（提供符号闭合）
-    #   libimgui.a           - Dear ImGui 核心 + imgui_impl_opengl3
-    ${IMGUI_LIBDIR}/libaimgui_core.a
-    ${IMGUI_LIBDIR}/libaimgui_platform.a
-    ${IMGUI_PREBUILT}/libimgui.a
-    # Capstone：imgui 侧本地反汇编（不占用 socket 通道）
-    ${CMAKE_CURRENT_SOURCE_DIR}/imgui/jni/capstone/lib/${ANDROID_ABI}/libcapstone.a
+    # Capstone：本地反汇编（不占用 socket 通道）
+    ${BACKEND_ROOT}/jni/capstone/lib/${ANDROID_ABI}/libcapstone.a
     # Android 系统库
-    GLESv3
-    EGL
-    android
     log
     m
 )

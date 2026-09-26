@@ -25,6 +25,7 @@
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/mman.h>
 #include <sys/un.h>
 #include <unistd.h>
 
@@ -281,6 +282,23 @@ std::string AgentHandleCommand(const std::string& cmd) {
     }
     if (cmd == "lua_count") {
         return std::to_string(LuaEngine::LogCount());
+    }
+    if (cmd.rfind("alloc ", 0) == 0) {
+        // "alloc <size> <prot>"：在 agent 所在的目标进程内 mmap，
+        // 地址直接作为响应传回，不经过 Lua/FFI。
+        unsigned long long size = 0;
+        int prot = PROT_READ | PROT_WRITE;
+        int n = sscanf(cmd.c_str(), "alloc %llu %d", &size, &prot);
+        if (n < 1 || size == 0)
+            return "ERR alloc usage: alloc <size> <prot>";
+        void* p = mmap(nullptr, (size_t)size, prot,
+                       MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (p == MAP_FAILED)
+            return "ERR mmap failed errno=" + std::to_string(errno);
+        char buf[64];
+        snprintf(buf, sizeof(buf), "ALLOC 0x%llx",
+                 (unsigned long long)(uintptr_t)p);
+        return buf;
     }
     if (cmd.rfind("lua_logs ", 0) == 0) {
         // 返回格式：第一行为当前日志总数（新水位），

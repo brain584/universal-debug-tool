@@ -6,11 +6,10 @@
 // 进程永远不会被停止或 ptrace，除非设置了
 // perf_event_attr 的 "sigtrap" 位（Linux >= 5.13）才会收到 SIGTRAP——我们从不
 // 设置它。目标的新线程通过周期性重扫捕获。
-//
-// 这是从零编写的 C++ 实现；只使用有文档的
-// perf_event_open ABI，不含任何 GPL 代码。
 
 #include "BreakpointService.h"
+
+#include <android/log.h>
 
 #include <dirent.h>
 #include <errno.h>
@@ -57,6 +56,7 @@ enum {
 enum {
     kPerfSampleTid      = 1U << 1,
     kPerfSampleRegsUser = 1U << 12,
+    kPerfSampleRegsIntr = 1U << 18,
 };
 
 enum {
@@ -297,13 +297,18 @@ static int OpenBpEvent(pid_t tid, const ActiveBp& bp, BpEvent& out) {
     attr.type             = kPerfTypeBreakpoint;
     attr.size             = kPerfAttrSizeCompat;
     attr.sample_period    = 1;
-    attr.sample_type      = kPerfSampleTid | kPerfSampleRegsUser;
+    // 同时请求 REGS_USER 与 REGS_INTR：某些内核上硬件断点的
+    // REGS_USER 会取到不全的寄存器（部分为 0），REGS_INTR 才是
+    // 异常发生瞬间的完整寄存器。解析时优先取非零更多的那个。
+    attr.sample_type      = kPerfSampleTid | kPerfSampleRegsUser |
+                            kPerfSampleRegsIntr;
     attr.flags            = kAttrExcludeKernel;   // 仅用户空间命中
     attr.wakeup_events    = 1;
     attr.bp_type          = (uint32_t)bp.type;
     attr.bp_addr          = bp.addr;
     attr.bp_len           = (uint64_t)bp.len;
     attr.sample_regs_user = kSampleRegsMask;
+    attr.sample_regs_intr = kSampleRegsMask;
 
     long fd = PerfEventOpenSyscall(&attr, tid, -1, -1, kPerfFlagFdCloexec);
     if (fd < 0) return -1;
@@ -475,9 +480,10 @@ static void EmitHit(const BpEvent& ev, uint32_t tid,
     // 堆栈字段格式：stack=0x<sp>>0x[sp]>0x[sp+8]>...（imgui 侧
     // 把 '>' 分隔符渲染为 '→'，每个条目都可点击）。
     char line[2048];
-    int pos = snprintf(line, sizeof(line), "HIT addr=0x%llx tid=%u pc=0x%llx",
+    int pos = snprintf(line, sizeof(line),
+                       "HIT addr=0x%llx tid=%u pc=0x%llx bpt=%d blen=%d",
                        (unsigned long long)ev.addr, tid,
-                       (unsigned long long)pc);
+                       (unsigned long long)pc, ev.type, ev.len);
     for (int i = 0; i < (int)regs.size() &&
                     pos < (int)sizeof(line) - 96; ++i) {
         pos += snprintf(line + pos, sizeof(line) - (size_t)pos,
@@ -493,6 +499,8 @@ static void EmitHit(const BpEvent& ev, uint32_t tid,
     }
     printf("%s\n", line);
     fflush(stdout);
+    // 同时写入 logcat（tag=ATraceBP），方便定位寄存器采样异常。
+    __android_log_print(ANDROID_LOG_INFO, "ATraceBP", "%s", line);
 }
 
 static void DrainEvent(BpEvent& ev) {
@@ -509,19 +517,38 @@ static void DrainEvent(BpEvent& ev) {
         if (tail + hdr.size > head) break;
 
         if (hdr.type == kPerfRecordSample) {
-            // PERF_SAMPLE_REGS_USER 记录布局：
-            //   header(8) + pid(4) + tid(4) + regs_user_abi(8) + regs(N*8)
-            // 必须跳过 abi 字（PERF_SAMPLE_REGS_ABI_64 == 2），
-            // 否则寄存器数组会整体错位
-            //（第一个"寄存器"会读到 abi 值）。
-            size_t need = 8 + 8 + 8 + (size_t)kRegCount * 8;
-            if (hdr.size >= need) {
+            // 记录布局：
+            //   header(8) + pid(4) + tid(4)
+            //   + [REGS_USER: abi(8) + regs(N*8)]
+            //   + [REGS_INTR: abi(8) + regs(N*8)]   （内核写入时才有）
+            // 必须跳过每段开头的 abi 字（PERF_SAMPLE_REGS_ABI_64 == 2）。
+            const size_t regBytes = (size_t)kRegCount * 8;
+            const size_t userOff  = 24;                 // 用户寄存器数组起点
+            const size_t needUser = userOff + regBytes; // header+TID+abi+regs
+            const size_t intrOff  = needUser + 8;       // 跳过 intr 的 abi
+            const size_t needIntr = intrOff + regBytes;
+            if (hdr.size >= needUser) {
                 uint32_t pid = 0, tid = 0;
                 RingRead(base, ev.data_size, tail + 8, &pid, 4);
                 RingRead(base, ev.data_size, tail + 12, &tid, 4);
-                std::vector<uint64_t> regs((size_t)kRegCount);
-                RingRead(base, ev.data_size, tail + 24, regs.data(),
-                         regs.size() * 8);
+                std::vector<uint64_t> userRegs((size_t)kRegCount);
+                RingRead(base, ev.data_size, tail + userOff, userRegs.data(),
+                         regBytes);
+                std::vector<uint64_t> regs = std::move(userRegs);
+                if (hdr.size >= needIntr) {
+                    std::vector<uint64_t> intrRegs((size_t)kRegCount);
+                    RingRead(base, ev.data_size, tail + intrOff,
+                             intrRegs.data(), regBytes);
+                    // 选择非零项更多的寄存器组（越完整越可信）；
+                    // 打平时沿用 REGS_USER。
+                    auto nonZero = [](const std::vector<uint64_t>& v) {
+                        size_t n = 0;
+                        for (uint64_t x : v) if (x) ++n;
+                        return n;
+                    };
+                    if (nonZero(intrRegs) > nonZero(userRegs))
+                        regs = std::move(intrRegs);
+                }
                 EmitHit(ev, tid, regs);
             }
         }

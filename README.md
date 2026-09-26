@@ -16,20 +16,21 @@
   - LuaJIT 脚本引擎（FFI）：`hookfunc` inline hook、`hookCPU` 寄存器级插桩、`call` 主动调用、内存读写辅助。
   - 硬件断点（root）：对目标进程所有线程下断，命中后回传寄存器、PC 与堆栈，地址可点击跳转内存页。
   - 反汇编（capstone）与汇编写入（asmjit）：内存页内可直接修改指令，例如输入 `~A8 nop`、`~A8 cset w0, ne`。
-- **悬浮窗 GUI**：ImGui 界面，支持收起 / 展开，解决触摸穿透、拉起输入法、可执行内存读写等功能。
+- **原生悬浮窗 GUI**：基于 Android View 的可拖动气泡 + 全屏面板（选项 / 搜索 / 保存 / 内存 / 断点 / 脚本六个 Tab），支持拖动、Tab 切换、深色模式显示；不依赖 ImGui 渲染。
 
 ## 构建
 
-- Android Studio 工程，执行 `assembleDebug` 可一次性构建 GUI（imgui）、agent.so、注入器并打包为一个 APK。
+- Android Studio 工程，执行 `assembleDebug` 可一次性构建原生悬浮窗（Kotlin + JNI）、agent.so、注入器并打包为一个 APK。
 - 使用注入、断点、socket relay 等功能需要 root 权限。
 
 ## 项目结构
 
-`app/src/main/cpp` 下主要分三部分：
+- Kotlin 原生悬浮窗 UI：`app/src/main/java/com/Alive/Trace/overlay`（气泡、面板、各功能页、JNI 桥）。
+- `app/src/main/cpp` 下主要分三部分：
 
 | 目录 | 说明 |
 | --- | --- |
-| `imgui` | GUI 端：悬浮窗渲染、ImGui 界面、触摸处理、socket 客户端、内存搜索、反汇编、汇编写入；所依赖的开源库（imgui、capstone、asmjit、memsearch 等）直接放在该目录下 |
+| `backend` | 后端复用层：内存搜索（memorysearch）、断点客户端（BpService）、socket 客户端、反汇编（capstone）、汇编写入（asmjit）；由 `overlay_bridge.cpp` 通过 JNI 暴露给悬浮窗 |
 | `agent` | SO 端：注入目标进程，内置 LuaJIT、Dobby、xDL、socket 服务端与内存工具 |
 | `injector` | 注入器：ptrace 注入、ELF 解析、root 服务（密钥生成、socket relay、断点服务） |
 
@@ -55,7 +56,7 @@
 
 ### 内存搜索
 
-- 搜索引擎运行在 imgui 侧（MemorySearch，MIT）：GUI 进程非 root，无法直接 open 目标进程 `/proc/<pid>/mem`，因此通过新增的 MemSu 后端（`su` + `dd` 管道）读写目标内存，`maps` 枚举同样走 su，不占用 agent socket 通道。
+- 搜索引擎运行在应用进程内（MemorySearch，MIT）：应用进程非 root，无法直接 open 目标进程 `/proc/<pid>/mem`，因此通过新增的 MemSu 后端（`su` + `dd` 管道）读写目标内存，`maps` 枚举同样走 su，不占用 agent socket 通道。
 - 精确 / 范围搜索已接入该引擎（多线程并行扫描）；模糊搜索与"改善"仍为旧实现。
 
 ### 断点实现
@@ -67,28 +68,25 @@
 
 ## 已知问题
 
-1. 新建子 GUI（如链接库窗口、内存修改窗口）会导致主 UI 闪现，关闭子窗口后主窗口位置可能被重置。
-2. 新建子 GUI 后系统触摸事件会被拦截，出现"只有 ImGui 可交互、系统界面触摸失灵"的问题（悬浮窗整体已做不触摸穿透处理，子窗口路径仍有该缺陷）。
-3. 断点堆栈结果可能不准，无法确定：目前只做 native 帧回溯（PC + LR），JNI 调用场景无法还原 Java 调用帧，且依赖目标函数的帧指针与寄存器状态，结果仅供参考。
+1. 断点堆栈结果可能不准：目前只做 native 帧回溯（PC + LR），JNI 调用场景无法还原 Java 调用帧，且依赖目标函数的帧指针与寄存器状态，结果仅供参考。
+2. 部分内核/机型上硬件断点采样到的个别寄存器可能为 0（`PERF_SAMPLE_REGS_USER` 的内核行为差异）；代码已追加 `PERF_SAMPLE_REGS_INTR` 兜底，仍以真机表现为准。
+3. Android 10+ 会对后台应用的剪贴板读写做限制：默认直接写剪贴板，若 ROM 禁止，可在「选项」页开启「兼容复制」。
 
 ## 可优化方向
 
 - 模糊搜索与"改善"仍为旧实现（单块 su 读取 + 单线程扫描），尚未接入 MemorySearch 引擎。
-- 子窗口渲染与触摸分发：可考虑子窗口独立纹理渲染、统一触摸事件分发路径，从根源上解决闪现与触摸拦截问题。
 
 ## 参考库与改动说明
 
 | 库 | 用途 | 改动情况 | 许可证 |
 | --- | --- | --- | --- |
-| [Qimgui](https://github.com/ohno1007/Qimgui) | Android 端 ImGui 悬浮窗基础 | 修复了触摸穿透；修改了界面布局，UI 重写为调试工具界面 | 上游未明确标注（内部 ANativeWindowCreator.h 标 MIT，另含 AndroidSurfaceImgui-Enhanced（MIT）与 Google NDK Vulkan wrapper（Apache-2.0）），详见上游仓库 |
-| [imgui](https://github.com/ocornut/imgui) | GUI 渲染 | 预编译，核心未改动 | MIT |
 | [asmjit](https://github.com/asmjit/asmjit) | AArch64 汇编文本写入 | 未改源码，仅新增封装层（Disasm/AsmWrite.h）；CMake 只编译 core/support/arm 子集 | Zlib |
 | [capstone](https://github.com/capstone-engine/capstone) | 反汇编 | 未改源码 | BSD-3-Clause |
 | [xDL](https://github.com/hexhacking/xDL) | so 遍历、基址解析 | 未改源码 | MIT |
 | [LuaJIT](https://github.com/LuaJIT/LuaJIT) | 脚本引擎 | 未改源码 | MIT |
 | [Dobby](https://github.com/jmpews/Dobby) | inline hook | 未改源码，使用预编译 `libdobby.a`，经 LuaEngine 薄封装 | Apache-2.0 |
 | [AndroidInject](https://github.com/niqiuqiux/AndroidInject) | ptrace 注入器基础 | 未改源码 | 上游未确认，详见上游仓库 |
-| [MemorySearch](https://github.com/Aboy-g/MemorySearch) | 内存读写 / 搜索（imgui 侧） | 剔除 Keystone 依赖（write_assembly，避免引入 GPL）；新增 su 后端适配器 MemSu；maps 读取改为 su 管道；源码位于 `imgui/jni/memsearch` | MIT |
+| [MemorySearch](https://github.com/Aboy-g/MemorySearch) | 内存读写 / 搜索 | 剔除 Keystone 依赖（write_assembly，避免引入 GPL）；新增 su 后端适配器 MemSu；maps 读取改为 su 管道；源码位于 `backend/jni/memsearch` | MIT |
 
 ## 开源协议
 
@@ -96,7 +94,7 @@
 
 ## 致谢
 
-感谢以下开源项目及其作者：Qimgui、ImGui、asmjit、capstone、xDL、LuaJIT、Dobby、AndroidInject、MemorySearch。
+感谢以下开源项目及其作者：asmjit、capstone、xDL、LuaJIT、Dobby、AndroidInject、MemorySearch。
 
 特别感谢 AlguiMemTool.h 的作者 **ByteCat**（MIT License）：本项目内存分类规则（MemToolTypes.h）基于该库提取，使用过程中保留了原始版权声明与注释。
 

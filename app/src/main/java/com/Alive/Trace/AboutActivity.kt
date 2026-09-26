@@ -24,16 +24,13 @@ class AboutActivity : AppCompatActivity() {
 
     // 与 README 参考库表一致；修改 README 时同步这里。
     private val libs = listOf(
-        Lib("Qimgui", "Android 端 ImGui 悬浮窗基础（已修复触摸穿透、重写 UI）",
-            "详见上游", "https://github.com/ohno1007/Qimgui"),
-        Lib("imgui", "GUI 渲染", "MIT", "https://github.com/ocornut/imgui"),
         Lib("asmjit", "AArch64 汇编文本写入", "Zlib", "https://github.com/asmjit/asmjit"),
         Lib("capstone", "反汇编", "BSD-3-Clause", "https://github.com/capstone-engine/capstone"),
         Lib("xDL", "so 遍历、基址解析", "MIT", "https://github.com/hexhacking/xDL"),
         Lib("LuaJIT", "脚本引擎", "MIT", "https://github.com/LuaJIT/LuaJIT"),
         Lib("Dobby", "inline hook", "Apache-2.0", "https://github.com/jmpews/Dobby"),
         Lib("AndroidInject", "ptrace 注入器基础", "详见上游", "https://github.com/niqiuqiux/AndroidInject"),
-        Lib("MemorySearch", "内存读写 / 搜索（imgui 侧，剔除 Keystone）",
+        Lib("MemorySearch", "内存读写 / 搜索（剔除 Keystone）",
             "MIT", "https://github.com/Aboy-g/MemorySearch"),
     )
 

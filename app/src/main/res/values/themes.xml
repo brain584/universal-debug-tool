@@ -22,6 +22,15 @@
         <item name="cornerSize">50%</item>
     </style>
 
+    <!-- 复制兜底：透明、无动画，短暂前台写剪贴板 -->
+    <style name="Theme.ATrace.Transparent" parent="@android:style/Theme.Translucent.NoTitleBar">
+        <item name="android:windowBackground">@android:color/transparent</item>
+        <item name="android:windowIsTranslucent">true</item>
+        <item name="android:windowNoTitle">true</item>
+        <item name="android:colorBackgroundCacheHint">@null</item>
+        <item name="android:windowAnimationStyle">@null</item>
+    </style>
+
     <!-- 配色主题变体：只覆盖强调色，其余继承默认主题 -->
     <style name="Theme.UnversalDebugTool.Blue">
         <item name="colorPrimary">@color/accent_blue</item>

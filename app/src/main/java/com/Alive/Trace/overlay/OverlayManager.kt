@@ -44,6 +44,11 @@ class OverlayManager(val act: Activity, private val onExit: () -> Unit) {
     private var panel: View? = null
     private var expanded = false
 
+    // 独立悬浮断点控件：每下一个断点就出现一个小按钮，
+    // 显示断点 id，点击销毁并清除该断点。
+    private val bpChips = mutableListOf<View>()
+    private var bpChipSeq = 0
+
     var bubbleDp = prefs.getInt("bubble_dp", 52)
     var panelAlpha = prefs.getInt("panel_alpha", 88)  // 0..100
     private var bubbleX = prefs.getInt("bubble_x", 24)
@@ -83,6 +88,7 @@ class OverlayManager(val act: Activity, private val onExit: () -> Unit) {
         bubble = null
         panel?.let { runCatching { wm.removeView(it) } }
         panel = null
+        clearBpChips()
         expanded = false
         pageCache.clear()
     }
@@ -180,6 +186,12 @@ class OverlayManager(val act: Activity, private val onExit: () -> Unit) {
         panel = panelRoot
         applyAlpha()
         switchTab(prefs.getString("last_tab", "选项") ?: "选项")
+        // 未选择目标进程时，展开面板立即弹出进程选择，避免用户
+        // 在搜索/内存页操作时才发现没有目标。
+        if (OState.pid <= 0) {
+            switchTab("选项")
+            (pageObjs["选项"] as? OptionsPage)?.openProcessDialog()
+        }
         // pageObjs 随面板重建而清空（页内临时状态存于 OState）。
     }
 
@@ -303,6 +315,12 @@ class OverlayManager(val act: Activity, private val onExit: () -> Unit) {
         (v.parent as? ViewGroup)?.removeView(v)
         content.addView(v, FrameLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
+        // 切换/打开页面时自动刷新对应页的状态（搜索结果数值/内存数值/保存列表）。
+        when (name) {
+            "搜索" -> (pageObjs[name] as? SearchPage)?.refresh()
+            "内存" -> (pageObjs[name] as? MemoryPage)?.refresh()
+            "保存" -> (pageObjs[name] as? SavedPage)?.refresh()
+        }
         for ((t, tv) in tabViews) {
             val sel = t == name
             tv.setTextColor(if (sel) 0xFF1B8C3C.toInt() else 0xFF444444.toInt())
@@ -357,7 +375,6 @@ class OverlayManager(val act: Activity, private val onExit: () -> Unit) {
             setTypeface(null, Typeface.BOLD)
         }, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT,
             ViewGroup.LayoutParams.WRAP_CONTENT).apply { bottomMargin = dp(10) })
-        body.setOnClickListener { dismissDialogs() }
         card.addView(body, LinearLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
 
@@ -424,6 +441,69 @@ class OverlayManager(val act: Activity, private val onExit: () -> Unit) {
         if (expanded) applyAlpha()
     }
 
+    // ── 独立悬浮断点控件 ────────────────────────────────────────────
+    // 下断后出现一个显示 "断点 <id>" 的小按钮；点击它即销毁该按钮
+    // 并向断点服务下发 clear，停止该断点。
+    fun addBpChip(addr: Long) {
+        if (addr <= 0) return
+        val id = ++bpChipSeq
+        val chip = TextView(act).apply {
+            text = "断点 $id"
+            textSize = 12f
+            setTextColor(0xFFFFFFFF.toInt())
+            setPadding(dp(10), dp(6), dp(10), dp(6))
+            background = GradientDrawable().apply {
+                setColor(0xEED32F2F.toInt())
+                cornerRadius = dp(14).toFloat()
+            }
+            isClickable = true
+            isFocusable = true
+            setOnClickListener {
+                runCatching { NativeBridge.bpClear(addr) }
+                runCatching { wm.removeView(this) }
+                bpChips.remove(this)
+                layoutBpChips()
+                // 最后一个断点被关闭时，同步停止断点服务；命中结果保留。
+                if (bpChips.isEmpty()) {
+                    runCatching { NativeBridge.bpStop() }
+                }
+                (pageObjs["断点"] as? BpPage)?.onTick()
+            }
+        }
+        val lp = WindowManager.LayoutParams(
+            WindowManager.LayoutParams.WRAP_CONTENT,
+            WindowManager.LayoutParams.WRAP_CONTENT,
+            overlayType,
+            WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL or
+                WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
+            PixelFormat.TRANSLUCENT
+        ).apply { gravity = Gravity.TOP or Gravity.RIGHT }
+        runCatching {
+            wm.addView(chip, lp)
+            bpChips.add(chip)
+            layoutBpChips()
+        }.onFailure { e ->
+            runCatching { wm.removeView(chip) }
+            toast("断点控件创建失败: ${e.message}")
+        }
+    }
+
+    private fun layoutBpChips() {
+        bpChips.forEachIndexed { i, v ->
+            val lp = v.layoutParams as? WindowManager.LayoutParams ?: return@forEachIndexed
+            lp.gravity = Gravity.TOP or Gravity.RIGHT
+            lp.x = dp(8)
+            lp.y = dp(96) + i * dp(44)
+            runCatching { wm.updateViewLayout(v, lp) }
+        }
+    }
+
+    fun clearBpChips() {
+        for (v in bpChips.toList()) runCatching { wm.removeView(v) }
+        bpChips.clear()
+    }
+
     // ── 状态刷新 ────────────────────────────────────────────────────
 
     fun onUi(f: () -> Unit) {
@@ -452,6 +532,14 @@ class OverlayManager(val act: Activity, private val onExit: () -> Unit) {
             handler.postDelayed({ tick() }, 1000)
             return
         }
+        // 目标进程退出（主动或被动）后自动重置整个悬浮窗状态。
+        val alive = OState.pid <= 0 ||
+            runCatching { NativeBridge.procAlive(OState.pid) }.getOrDefault(true)
+        if (!alive) {
+            resetForDeadProcess()
+            handler.postDelayed({ tick() }, 1000)
+            return
+        }
         val title = "[${OState.pid}] ${OState.pname}"
         if (title != lastTitle) {
             statusTitle.text = title
@@ -472,6 +560,28 @@ class OverlayManager(val act: Activity, private val onExit: () -> Unit) {
             lastFooter = st
         }
         (pageObjs["搜索"] as? SearchPage)?.let { if (curTab == "搜索") it.onTick() }
+        (pageObjs["保存"] as? SavedPage)?.let { if (curTab == "保存") it.onTick() }
         handler.postDelayed({ tick() }, 1000)
+    }
+
+    /** 目标进程已死：停服务、清结果、清断点控件并重新选择进程。 */
+    private fun resetForDeadProcess() {
+        val dead = OState.pid
+        runCatching { NativeBridge.bpStop() }
+        runCatching { NativeBridge.bpClearHits() }
+        runCatching { NativeBridge.searchReset() }
+        Freezer.stopAll()
+        synchronized(OState.saved) { OState.saved.clear() }
+        clearBpChips()
+        OState.pid = 0
+        OState.pname = "-"
+        OState.pkg = ""
+        lastTitle = ""
+        lastCountText = ""
+        lastFooter = ""
+        (pageObjs["保存"] as? SavedPage)?.refresh()
+        setFooter("进程 $dead 已退出，已重置")
+        switchTab("选项")
+        (pageObjs["选项"] as? OptionsPage)?.openProcessDialog()
     }
 }

@@ -69,7 +69,7 @@
                         android:layout_width="wrap_content"
                         android:layout_height="wrap_content"
                         android:layout_marginTop="4dp"
-                        android:text="ImGui Overlay 调试器"
+                        android:text="原生悬浮窗调试器"
                         android:textColor="@color/text_secondary"
                         android:textSize="16sp" />
                 </LinearLayout>
@@ -151,7 +151,7 @@
             android:layout_height="wrap_content"
             android:layout_marginTop="10dp"
             android:gravity="center"
-            android:text="启动后，ImGui 调试界面将显示在所有应用上层"
+            android:text="启动后，悬浮窗将显示在所有应用上层"
             android:textColor="@color/text_hint"
             android:textSize="14sp" />
     </LinearLayout>
