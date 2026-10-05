@@ -150,6 +150,90 @@ jstring ToJString(JNIEnv* env, const std::string& s) {
     return env->NewStringUTF(s.c_str());
 }
 
+// 按类型把当前值 cur 与目标值 target 做"相等"判定。
+// 注意不能统一按 int64 比较：宽度不同时 target 只填了低 sizeof(T) 字节，
+// 高位可能为 0，直接比 int64 会漏判。
+template <typename T>
+bool HitEq(uint64_t cur, int64_t target) {
+    T c;
+    memcpy(&c, &cur, sizeof(T));
+    return c == (T)target;
+}
+
+// 改善的并发度与分块大小。
+//
+// 两个必须遵守的约束（都踩过坑）：
+//  1) 内存有界。ReadRemotePages 为涉及到的每一页分配 4096 字节，而命中
+//     地址通常分散（一页一个）。若一次性对所有命中构造页表，20 万条
+//     命中就是 ~800MB 缓冲，会抛 std::bad_alloc；异常逃出 detached
+//     线程即 std::terminate（SIGABRT 闪退）。因此按小块处理。
+//  2) 远程读取串行。读取走 popen("su -c ...")，在 Android 上多线程
+//     并发 fork 出 su 进程不安全（也是闪退来源）。所以「读」用全局锁
+//     串行，「比较」才并行——远程 I/O 本来就是瓶颈，并行读没有收益。
+constexpr int    kRefineThreads = 4;
+constexpr size_t kRefineChunk   = 4096;   // 每块命中数（页缓冲 ≈16MB）
+
+// 把 [begin, end) 这段命中涉及的页读回来（串行调用）。
+// values 按 values(pageIdx * 4096 + offsetInPage)。
+bool ReadRefinePages(int pid, const std::vector<Hit>& hits, size_t begin,
+                     size_t end, int stride, std::vector<uintptr_t>& pages,
+                     std::vector<uint8_t>& values) {
+    pages.clear();
+    pages.reserve((end - begin) * 2);
+    for (size_t i = begin; i < end; ++i) {
+        uintptr_t pg = hits[i].addr & ~(uintptr_t)4095;
+        pages.push_back(pg);
+        // 值跨越页边界时把下一页也带上。
+        if (((hits[i].addr & 4095) + (uintptr_t)stride) > 4096)
+            pages.push_back(pg + 4096);
+    }
+    std::sort(pages.begin(), pages.end());
+    pages.erase(std::unique(pages.begin(), pages.end()), pages.end());
+    if (pages.empty()) return true;
+    return ReadRemotePages(pid, pages, values);
+}
+
+// 纯 CPU 比较：在已读回的 pages/values 上把 [begin, end) 中当前值等于
+// target 的命中追加到 out。不下线程、不做 I/O，可安全并行。
+void CompareRefineChunk(const std::vector<Hit>& hits, size_t begin, size_t end,
+                        int type, int64_t target,
+                        const std::vector<uintptr_t>& pages,
+                        const std::vector<uint8_t>& values,
+                        std::vector<Hit>& out) {
+    const int stride = MemTypeSize(type);
+    for (size_t i = begin; i < end; ++i) {
+        uintptr_t pg = hits[i].addr & ~(uintptr_t)4095;
+        size_t pi = (size_t)(std::lower_bound(pages.begin(), pages.end(), pg) -
+                             pages.begin());
+        size_t off = (size_t)(hits[i].addr & 4095);
+        uint64_t cur = 0;
+        uint8_t* dst = (uint8_t*)&cur;
+        if (off + (size_t)stride <= 4096) {
+            memcpy(dst, values.data() + pi * 4096 + off, (size_t)stride);
+        } else {
+            size_t first = 4096 - off;
+            memcpy(dst, values.data() + pi * 4096 + off, first);
+            memcpy(dst + first, values.data() + (pi + 1) * 4096,
+                   (size_t)stride - first);
+        }
+        bool eq = false;
+        switch (type) {
+        case TYPE_BYTE:   eq = HitEq<int8_t>(cur, target);   break;
+        case TYPE_WORD:   eq = HitEq<int16_t>(cur, target);  break;
+        case TYPE_DWORD:  eq = HitEq<int32_t>(cur, target);  break;
+        case TYPE_QWORD:  eq = HitEq<int64_t>(cur, target);  break;
+        case TYPE_FLOAT:  eq = HitEq<float>(cur, target);    break;
+        case TYPE_DOUBLE: eq = HitEq<double>(cur, target);   break;
+        default:          eq = HitEq<int32_t>(cur, target);  break;
+        }
+        if (eq) {
+            Hit h = hits[i];
+            h.raw = cur;   // 保存最新值，供下一轮改善比较
+            out.push_back(h);
+        }
+    }
+}
+
 } // namespace
 
 extern "C" {
@@ -689,36 +773,78 @@ Java_com_Alive_Trace_overlay_NativeBridge_searchRefine(JNIEnv* env, jobject,
             g_running.store(false);
             return;
         }
-        std::vector<uint8_t> vals;
-        if (!ReadHitValues(pid, hits, type, vals)) {
-            SetStatus("读取当前值失败");
-            g_running.store(false);
-            return;
+        const bool isFloat = (type == TYPE_FLOAT || type == TYPE_DOUBLE);
+        // 改善目标值：按类型取整型/浮点两个解析结果中对应的那个。
+        const int64_t target = isFloat ? (int64_t)dv : iv;
+        const int stride = MemTypeSize(type);
+
+        // 原子取块 + 多线程比较；远程读取用全局锁串行化。
+        // 「读」走 popen("su -c ...")，Android 上并发 fork su 不安全；
+        // 而远程 I/O 本来就是瓶颈，并发读没有收益只有风险。所以读串行、
+        // 比较并行（比较是纯 CPU，且每块只持有自己那几页，内存有界）。
+        const size_t total = hits.size();
+        const size_t nchunks = (total + kRefineChunk - 1) / kRefineChunk;
+        size_t nthreads = (size_t)kRefineThreads;
+        if (nthreads > nchunks) nthreads = nchunks;
+        if (nthreads == 0) nthreads = 1;
+
+        std::vector<std::vector<Hit>> parts(nchunks);
+        std::atomic<size_t> nextChunk{0};
+        std::atomic<bool> readFailed{false};
+        static std::mutex suMutex;   // 串行化本模块所有 su/popen 读取
+
+        std::vector<std::thread> workers;
+        workers.reserve(nthreads);
+        for (size_t t = 0; t < nthreads; ++t) {
+            workers.emplace_back([&] {
+                // detached 线程里逃出异常 = std::terminate（闪退），全部消化。
+                try {
+                    for (;;) {
+                        size_t c = nextChunk.fetch_add(1);
+                        if (c >= nchunks) break;
+                        const size_t begin = c * kRefineChunk;
+                        const size_t end = std::min(total, begin + kRefineChunk);
+                        std::vector<uintptr_t> pages;
+                        std::vector<uint8_t> values;
+                        bool ok;
+                        {
+                            // 只有这一个临界区碰 su；不持锁做比较。
+                            std::lock_guard<std::mutex> lk(suMutex);
+                            ok = ReadRefinePages(pid, hits, begin, end, stride,
+                                                 pages, values);
+                        }
+                        if (!ok) { readFailed.store(true); continue; }
+                        parts[c].reserve(end - begin);
+                        CompareRefineChunk(hits, begin, end, type, target,
+                                           pages, values, parts[c]);
+                    }
+                } catch (const std::exception& ex) {
+                    OLOG("refine worker exception: %s", ex.what());
+                    readFailed.store(true);
+                } catch (...) {
+                    OLOG("refine worker unknown exception");
+                    readFailed.store(true);
+                }
+            });
         }
-        int stride = MemTypeSize(type);
-        bool isFloat = (type == TYPE_FLOAT || type == TYPE_DOUBLE);
+        for (auto& w : workers) w.join();
+
+        // 按分块顺序合并，保持结果顺序与串行版一致。
         std::vector<Hit> kept;
-        for (size_t i = 0; i < hits.size(); ++i) {
-            uint64_t cur = 0;
-            memcpy(&cur, vals.data() + i * (size_t)stride, (size_t)stride);
-            bool eq = false;
-            if (isFloat) {
-                double cf;
-                memcpy(&cf, &cur, 8);
-                eq = cf == dv;
-            } else {
-                eq = (int64_t)cur == iv;
-            }
-            if (eq) {
-                hits[i].raw = cur;
-                kept.push_back(hits[i]);
-            }
-        }
+        kept.reserve(total);
+        for (auto& p : parts)
+            for (auto& h : p) kept.push_back(h);
         double sec = std::chrono::duration<double>(
                          std::chrono::steady_clock::now() - t0).count();
-        char msg[160];
-        snprintf(msg, sizeof(msg), "改善完成: %zu / %zu (耗时 %.1fs)",
-                 kept.size(), hits.size(), sec);
+        char msg[192];
+        if (readFailed.load() && kept.empty()) {
+            snprintf(msg, sizeof(msg),
+                     "改善失败: 读取目标内存出错 (目标已退出？)");
+        } else {
+            snprintf(msg, sizeof(msg),
+                     "改善完成: %zu / %zu (耗时 %.1fs)",
+                     kept.size(), total, sec);
+        }
         std::lock_guard<std::mutex> lk(g_mux);
         g_hits = std::move(kept);
         g_status = msg;

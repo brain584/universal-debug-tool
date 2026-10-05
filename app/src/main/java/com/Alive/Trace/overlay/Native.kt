@@ -1,5 +1,9 @@
 package com.Alive.Trace.overlay
 
+import android.content.Context
+import android.os.Handler
+import android.os.Looper
+import android.widget.Toast
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 
@@ -79,14 +83,38 @@ object MT {
     /** 地址统一显示格式（与内存页一致：大写、至少 8 位、无 0x）。 */
     fun addr(a: Long): String = "%08X".format(a)
 
+    /**
+     * 把「按类型宽度截断的原始值」还原成该类型的有符号值。
+     *
+     * 内存里 4 字节的 0xFFFFFFFB 就是 int32 的 -5；但搜索/读取回来的
+     * raw 是宽度无关的 Long，高位没有做符号扩展，直接按无符号显示会
+     * 变成 4294967291（这就是「d 类型负数溢出显示为正整数」的原因）。
+     */
+    fun normalizeRaw(t: Int, raw: Long): Long = when (t) {
+        BYTE -> raw.toByte().toLong()
+        WORD -> raw.toShort().toLong()
+        DWORD -> raw.toInt().toLong()
+        else -> raw            // QWORD/FLOAT/DOUBLE 本身是 8 字节宽度
+    }
+
+    /** 各类型的数值范围文本（供保存时选择格式用）。 */
+    fun typeRange(t: Int): String = when (t) {
+        BYTE -> "-128 ~ 127"
+        WORD -> "-32768 ~ 32767"
+        DWORD -> "-2147483648 ~ 2147483647"
+        QWORD -> "-9223372036854775808 ~ 9223372036854775807"
+        FLOAT -> "约 ±3.4e38 (7 位有效数字)"
+        else -> "约 ±1.8e308 (15 位有效数字)"
+    }
+
     /** raw 按类型格式化为显示值。 */
-    fun fmt(t: Int, raw: Long): String = when (t) {
-        BYTE -> raw.toByte().toString()
-        WORD -> raw.toShort().toString()
-        DWORD -> raw.toInt().toString()
-        QWORD -> java.lang.Long.toUnsignedString(raw)
-        FLOAT -> floatFromBits(raw.toInt()).toString()
-        else -> doubleFromBits(raw).toString()
+    fun fmt(t: Int, raw: Long): String {
+        val v = normalizeRaw(t, raw)
+        return when (t) {
+            BYTE, WORD, DWORD, QWORD -> v.toString()
+            FLOAT -> floatFromBits(v.toInt()).toString()
+            else -> doubleFromBits(v).toString()
+        }
     }
 
     private fun floatFromBits(b: Int) = Float.fromBits(b)
@@ -103,7 +131,9 @@ object MT {
                     BYTE -> bb.put(text.trim().toByte())
                     WORD -> bb.putShort(text.trim().toShort())
                     DWORD -> bb.putInt(text.trim().toInt())
-                    QWORD -> bb.putLong(parseUnsigned(text))
+                    // QWORD 按有符号取值，负数可正常写入（toLong 溢出会抛异常
+                    // → 返回 null，调用方提示格式错误）。
+                    QWORD -> bb.putLong(text.trim().toLong())
                     FLOAT -> bb.putFloat(text.trim().toFloat())
                     else -> bb.putDouble(text.trim().toDouble())
                 }
@@ -129,7 +159,7 @@ object MT {
         null
     }
 
-    /** 无符号十进制/0x 十六进制文本 → Long。 */
+    /** 无符号十进制/0x 十六进制文本 → Long（断点寄存器等原始值用）。 */
     fun parseUnsigned(s: String): Long {
         val t = s.trim()
         return if (t.startsWith("0x") || t.startsWith("0X"))
@@ -144,7 +174,7 @@ object MT {
             BYTE -> text.trim().toByte().toLong()
             WORD -> text.trim().toShort().toLong()
             DWORD -> text.trim().toInt().toLong()
-            QWORD -> parseUnsigned(text)
+            QWORD -> text.trim().toLong()
             FLOAT -> text.trim().toFloat().toBits().toLong()
             else -> text.trim().toDouble().toBits()
         }
@@ -178,6 +208,113 @@ object OState {
     val saved = mutableListOf<SavedRow>()
     var searchType = MT.DWORD
     val areas = mutableListOf(Areas.ALL)
+}
+
+/**
+ * SO 通道（加密 socket）小工具。
+ *
+ * 连接目标 socket 名由后端固定（`udt_debug_chan`），因此这里只负责
+ * 偏好开关与状态读取——供选项页显示连接状态、以及注入成功后
+ * 按「注入后自动连接 socket」自动建连。
+ */
+object SocketUtil {
+    private const val PREF = "overlay"
+    private const val KEY_AUTO_CONNECT = "inject_autoconnect"
+
+    /** 最近一次成功注入的目标包名（注入后自动连接时用它做通道目标）。 */
+    @Volatile var lastInjectedPkg = ""
+
+    fun isAutoConnect(ctx: Context): Boolean = runCatching {
+        ctx.getSharedPreferences(PREF, Context.MODE_PRIVATE)
+            .getBoolean(KEY_AUTO_CONNECT, false)
+    }.getOrDefault(false)
+
+    fun setAutoConnect(ctx: Context, on: Boolean) {
+        runCatching {
+            ctx.getSharedPreferences(PREF, Context.MODE_PRIVATE)
+                .edit().putBoolean(KEY_AUTO_CONNECT, on).apply()
+        }
+    }
+
+    fun isConnected(): Boolean =
+        runCatching { NativeBridge.socketIsConnected() }.getOrDefault(false)
+
+    fun statusText(): String =
+        runCatching { NativeBridge.socketStatus() }.getOrDefault("未连接")
+
+    /** 建连前登记目标包名（失败不影响连接：socket 名是固定的）。 */
+    fun prepareTarget(pkg: String) {
+        runCatching { NativeBridge.socketSetTarget(pkg) }
+    }
+
+    /**
+     * 注入成功后调用：若已开启「注入后自动连接 socket」则发起连接。
+     * 后台轮询到真正连上再提示，避免给出错误的成功观感。
+     */
+    fun connectIfEnabled(ctx: Context, pkg: String) {
+        if (!isAutoConnect(ctx)) return
+        prepareTarget(pkg)
+        NativeBridge.socketConnect()
+        Thread {
+            for (i in 0 until 30) {
+                Thread.sleep(100)
+                if (isConnected()) {
+                    toast(ctx, "SO 通道已自动连接")
+                    return@Thread
+                }
+            }
+            toast(ctx, "SO 通道自动连接超时: " + statusText())
+        }.start()
+    }
+
+    /**
+     * 注入成功后把目标进程设为当前进程（自动选择）。
+     *
+     * 目标进程可能刚被拉起，所以带重试；同时清掉上一个进程的搜索
+     * 结果，否则搜索/内存会在新进程上读到陈旧地址。
+     *
+     * 内部起后台线程：调用方可能在主线程（对话框按钮回调），而这里
+     * 要轮询扫描 /proc，绝不能卡 UI。
+     */
+    fun selectProcessAfterInject(overlay: OverlayManager, pkg: String,
+                                 pname: String) {
+        val target = pkg.ifEmpty { pname }
+        Thread {
+            var pid = 0
+            for (i in 0 until 10) {
+                if (target.isNotEmpty()) pid = resolvePidByPkg(target)
+                if (pid > 0) break
+                Thread.sleep(300)
+            }
+            val label = when {
+                pkg.isNotEmpty() -> pkg
+                pname.isNotEmpty() && pname != "-" -> pname
+                else -> target
+            }
+            overlay.onUi {
+                if (pkg.isNotEmpty()) OState.pkg = pkg
+                if (pid > 0) {
+                    val changed = OState.pid != pid
+                    OState.pid = pid
+                    if (label.isNotEmpty()) OState.pname = label
+                    if (changed) {
+                        // 换了进程：旧结果对不上号，清掉。
+                        runCatching { NativeBridge.searchReset() }
+                    }
+                    overlay.refreshProcRow()
+                    overlay.toast("已选择 [${OState.pid}] ${OState.pname}")
+                } else {
+                    overlay.toast("注入成功，但未解析到进程（可手动选择）")
+                }
+            }
+        }.start()
+    }
+
+    private fun toast(ctx: Context, msg: String) = runCatching {
+        android.os.Handler(android.os.Looper.getMainLooper()).post {
+            Toast.makeText(ctx, msg, Toast.LENGTH_SHORT).show()
+        }
+    }
 }
 
 /** 冻结：后台线程周期性把冻结行的值写回目标进程。 */

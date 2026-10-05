@@ -29,6 +29,30 @@ interface OverlayPage {
     fun build(): View
 }
 
+// ── 包名 / 进程辅助 ──
+
+/**
+ * 从 `scanProcesses()` 的输出（每行 `pid|uid|cmdline`）里解析某个包名的
+ * 主进程 PID。优先精确等于包名的进程（主进程），没有才退化为
+ * `包名:子进程` 形式。
+ *
+ * 必须放在文件级：`SearchPage` 等处也要用，避免嵌套函数无法共享。
+ */
+internal fun resolvePidByPkg(pkg: String): Int {
+    if (pkg.isEmpty()) return 0
+    val text = runCatching { NativeBridge.scanProcesses() }.getOrDefault("")
+    var fallback = 0
+    for (line in text.lineSequence()) {
+        val f = line.split('|')
+        if (f.size < 3) continue
+        val pid = f[0].toIntOrNull() ?: continue
+        val cmd = f[2]
+        if (cmd == pkg) return pid
+        if (fallback == 0 && cmd.startsWith("$pkg:")) fallback = pid
+    }
+    return fallback
+}
+
 // ── UI 辅助函数 ──
 
 internal fun dpc(ctx: Context, v: Int) =
@@ -60,7 +84,7 @@ private fun btn(ctx: Context, text: String, onClick: () -> Unit): TextView =
     }
 
 private fun edit(ctx: Context, hint: String): EditText =
-    EditText(ctx).apply {
+    ClipboardEditText(ctx).apply {
         this.hint = hint
         textSize = 14f
         setTextColor(0xFF222222.toInt())
@@ -85,34 +109,49 @@ private fun vcol(ctx: Context): LinearLayout =
 private fun divider(ctx: Context): View =
     View(ctx).apply { setBackgroundColor(0x14000000) }
 
+/** 通过透明前台 Activity 写剪贴板（Android 10+ 后台写入被禁时的兜底）。 */
+private fun copyViaActivity(ctx: Context, text: String) {
+    runCatching {
+        ctx.startActivity(
+            android.content.Intent(ctx, com.Alive.Trace.CopyActivity::class.java)
+                .putExtra(com.Alive.Trace.CopyActivity.EXTRA_TEXT, text)
+                .addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK))
+    }
+}
+
 /**
- * 复制文本。Android 10+ 后台应用写剪贴板受限，这里只做一次
- * 尽力而为的直写，绝不启动前台 Activity（那会把用户从悬浮窗
- * 强制拉回应用界面）。调用方同时弹出可长按选择的文本兜底。
+ * 复制文本。Android 10+ 禁止后台应用写剪贴板，而且被拦时
+ * `setPrimaryClip` 不抛异常（静默丢弃），所以这里写完必须校验：
+ *
+ *   1. 开了「兼容复制」→ 直接走透明 Activity（必然成功）；
+ *   2. 否则先尝试直写，读回剪贴板校验内容；
+ *   3. 校验不通过（被系统丢弃）→ 自动升级到透明 Activity 重写一次。
+ *
+ * 第 3 步是必要的：输入法菜单里的复制也走这里，如果只依赖选项页
+ * 那个开关，默认状态下输入法复制会静默失败（就是"复制没效果"）。
  */
 internal fun copyText(ctx: Context, text: String) {
     if (text.isEmpty()) return
-    // 兼容模式：部分 ROM 禁止后台应用写剪贴板，此时通过透明前台
-    // Activity 写入（会极短暂切到应用，可在选项页开关）。
-    val compat = runCatching {
+    val prefs = runCatching {
         ctx.getSharedPreferences("overlay", Context.MODE_PRIVATE)
-            .getBoolean("copy_compat", false)
+    }.getOrNull()
+    val compat = runCatching {
+        prefs?.getBoolean("copy_compat", false) ?: false
     }.getOrDefault(false)
     if (compat) {
-        runCatching {
-            ctx.startActivity(
-                android.content.Intent(ctx,
-                    com.Alive.Trace.CopyActivity::class.java)
-                    .putExtra(com.Alive.Trace.CopyActivity.EXTRA_TEXT, text)
-                    .addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK))
-        }
+        copyViaActivity(ctx, text)
         return
     }
-    runCatching {
+    val ok = runCatching {
         val cm = ctx.getSystemService(Context.CLIPBOARD_SERVICE)
             as android.content.ClipboardManager
         cm.setPrimaryClip(android.content.ClipData.newPlainText("ATrace", text))
-    }
+        // 读回校验：后台写入被拦时 setPrimaryClip 不报错，只能这样发现。
+        val back = cm.primaryClip?.takeIf { it.itemCount > 0 }
+            ?.getItemAt(0)?.coerceToText(ctx)?.toString()
+        back == text
+    }.getOrDefault(false)
+    if (!ok) copyViaActivity(ctx, text)
 }
 
 /** 深色模式也可读的 Spinner：显式指定下拉与选中项文字颜色。 */
@@ -208,12 +247,88 @@ internal fun bpDialog(m: OverlayManager, addr: Long) {
         }))
 }
 
+// ── 保存地址：先选内存格式 ──
+
+/**
+ * 保存地址前的「选择类型」。列出所有可显示的内存格式及其数值范围
+ * （MT.all：D/F/Q/W/B/E），点击某项即以该格式保存。
+ *
+ * 返回 true 表示弹出了对话框，由回调负责后续保存。
+ */
+internal fun chooseMemType(m: OverlayManager, current: Int, addr: Long,
+                           onPick: (Int) -> Unit) {
+    val ctx = m.act
+    val body = vcol(ctx)
+    body.addView(tv(ctx, "保存地址 ${MT.addr(addr)}", 13f,
+        0xFF666666.toInt(), true).apply { setPadding(0, 0, 0, dpc(ctx, 6)) })
+    for (t in MT.all) {
+        val row = vcol(ctx).apply {
+            setPadding(dpc(ctx, 10), dpc(ctx, 8), dpc(ctx, 10), dpc(ctx, 8))
+            isClickable = true
+            background = GradientDrawable().apply {
+                setColor(0x08000000)
+                cornerRadius = dpc(ctx, 6).toFloat()
+            }
+            setOnClickListener {
+                m.dismissDialogs()
+                onPick(t)
+            }
+        }
+        // 第一行：类型字母 + 名称（占用剩余宽度，长名也不会挤压范围）。
+        row.addView(tv(ctx, "${MT.letter(t)}    ${MT.name(t)}", 15f,
+            0xFF222222.toInt()))
+        // 第二行：数值范围。单行显示、超宽就省略号——之前并排放在
+        // 同一行里会把整行撑得极高（QWORD 那行占了"一大坨"）。
+        row.addView(tv(ctx, MT.typeRange(t), 11f, 0xFF999999.toInt(), true)
+            .apply {
+                isSingleLine = true
+                ellipsize = android.text.TextUtils.TruncateAt.END
+                setPadding(0, dpc(ctx, 2), 0, 0)
+            })
+        body.addView(row, LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT,
+            ViewGroup.LayoutParams.WRAP_CONTENT).apply { bottomMargin = dpc(ctx, 4) })
+    }
+    body.addView(tv(ctx, "当前格式: ${MT.name(current)}", 11f,
+        0xFF999999.toInt()).apply { setPadding(dpc(ctx, 2), dpc(ctx, 2), 0, 0) })
+    m.dialog("选择类型", body, listOf(Triple("取消", false) {}))
+}
+
+/**
+ * 以指定格式保存地址：读回当前内存值，按该格式显示。
+ * 返回是否真的新增（地址已存在则跳过）。
+ */
+internal fun saveAddrAs(m: OverlayManager, addr: Long, type: Int): Boolean {
+    val size = MT.size(type)
+    if (size <= 0 || OState.pid <= 0) return false
+    var inserted = false
+    synchronized(OState.saved) {
+        if (OState.saved.none { it.addr == addr }) {
+            val bytes = runCatching {
+                NativeBridge.memRead(OState.pid, addr, size)
+            }.getOrNull()
+            var raw = 0L
+            if (bytes != null) {
+                for (k in 0 until minOf(size, bytes.size))
+                    raw = raw or ((bytes[k].toLong() and 0xFF) shl (8 * k))
+            }
+            OState.saved.add(SavedRow(addr, type, MT.addr(addr),
+                MT.fmt(type, raw), false))
+            inserted = true
+        }
+    }
+    return inserted
+}
+
 // ── 选项页 ──
 
 class OptionsPage(private val m: OverlayManager) : OverlayPage {
 
     private lateinit var procValue: TextView
     private lateinit var areaValue: TextView
+    private lateinit var soValue: TextView
+    private var lastSoText = ""
+    private var lastSoColor = 0
     private var appInfoCache: Map<String, android.content.pm.ApplicationInfo>? = null
     private val iconCache = HashMap<String, android.graphics.drawable.Drawable?>()
 
@@ -258,6 +373,12 @@ class OptionsPage(private val m: OverlayManager) : OverlayPage {
             text = "按 PID / 包名"
             setTextColor(0xFF888888.toInt())
         }) { injectDialog() })
+        // 独立入口：不经过「选择进程」也能直接对任意 PID 注入
+        // （native ELF 等非应用进程没有可解析的包名，只能按 PID）。
+        col.addView(optionRow(ctx, "按 PID 注入", TextView(ctx).apply {
+            text = "直接指定 pid"
+            setTextColor(0xFF888888.toInt())
+        }) { injectPidDialog() })
         col.addView(optionRow(ctx, "杀死游戏进程", TextView(ctx).apply {
             text = "kill -9"
             setTextColor(0xFF888888.toInt())
@@ -332,12 +453,36 @@ class OptionsPage(private val m: OverlayManager) : OverlayPage {
         col.addView(copyRow)
 
         col.addView(section(ctx, "SO 通道"))
-        val soValue = TextView(ctx).apply {
-            text = "查看连接状态"
-            setTextColor(0xFF888888.toInt())
+
+        // 注入成功后是否自动连接 socket（配合脚本 / hook 使用）。
+        val autoRow = hrow(ctx).apply { setPadding(0, dpc(ctx, 4), 0, dpc(ctx, 4)) }
+        autoRow.addView(TextView(ctx).apply {
+            text = "注入后自动连接 socket"
+            textSize = 16f
+            setTextColor(0xFF222222.toInt())
+            layoutParams = LinearLayout.LayoutParams(0,
+                ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+        })
+        autoRow.addView(Switch(ctx).apply {
+            isChecked = SocketUtil.isAutoConnect(m.act)
+            setOnCheckedChangeListener { _, c ->
+                SocketUtil.setAutoConnect(m.act, c)
+                m.toast(if (c) "注入成功后将自动连接 SO 通道"
+                    else "已关闭自动连接")
+            }
+        })
+        col.addView(autoRow)
+
+        // 状态行：仅显示是否连接（绿=已连接 / 红=未连接），
+        // 点击打开 SO 通道操作面板（连接 / 断开）。
+        soValue = TextView(ctx).apply {
+            text = "未连接"
+            setTextColor(0xFFD32F2F.toInt())
+            setTypeface(null, Typeface.BOLD)
         }
         col.addView(optionRow(ctx, "连接 agent (脚本/hook)", soValue) {
-            soDialog(soValue) })
+            soDialog()
+        })
 
         col.addView(optionRow(ctx, "退出悬浮窗", TextView(ctx).apply {
             text = "›"
@@ -433,6 +578,11 @@ class OptionsPage(private val m: OverlayManager) : OverlayPage {
     }
 
     // ── 选择进程对话框 ──
+    /** 供 OverlayManager 在外部（注入成功自动选择进程）刷新进程行。 */
+    fun setProcLabel(label: String) {
+        if (::procValue.isInitialized) procValue.text = label
+    }
+
     /** 供 OverlayManager 在未选进程时自动弹出。 */
     fun openProcessDialog() {
         processDialog()
@@ -608,81 +758,260 @@ class OptionsPage(private val m: OverlayManager) : OverlayPage {
             textSize = 13f
             setTextColor(0xFF666666.toInt())
         })
+        val pkg = edit(ctx, "包名 (com.xxx.yyy)")
+        body.addView(pkg, LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT,
+            ViewGroup.LayoutParams.WRAP_CONTENT).apply { topMargin = dpc(ctx, 6) })
+        // 包名未运行时先拉起应用，等进程起来再注入。
+        val autoStart = CheckBox(ctx).apply {
+            text = "进程未运行时自动拉起后再注入"
+            textSize = 13f
+            setTextColor(0xFF333333.toInt())
+            isChecked = true
+        }
+        body.addView(autoStart, LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT,
+            ViewGroup.LayoutParams.WRAP_CONTENT).apply { topMargin = dpc(ctx, 4) })
         val resultTv = TextView(ctx).apply {
             textSize = 12f
             setTextColor(0xFF444444.toInt())
         }
-        val byPid = btn(ctx, " 当前进程注入") {
+        body.addView(resultTv, LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT,
+            ViewGroup.LayoutParams.WRAP_CONTENT).apply { topMargin = dpc(ctx, 6) })
+
+        // 两条注入路径并排放在最底部：包名输入框聚焦弹出键盘后，
+        // 对话框会被 ScrollView 滚动，横排能保证两个按钮都还在可视区内
+        // （之前纵向堆叠时「当前进程注入」会被滚出屏幕，看起来像没了）。
+        val btns = hrow(ctx)
+        btns.addView(btn(ctx, "当前进程注入") {
             if (OState.pid <= 0) { m.toast("请先选择进程"); return@btn }
-            runInject(resultTv) { NativeBridge.injectPid(OState.pid) }
-        }
-        body.addView(byPid, LinearLayout.LayoutParams(
+            runInject(resultTv, "") { NativeBridge.injectPid(OState.pid) }
+        }, LinearLayout.LayoutParams(0,
+            ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply { marginEnd = dpc(ctx, 6) })
+        btns.addView(btn(ctx, "按包名注入") {
+            val name = pkg.text.toString().trim()
+            if (name.isEmpty()) { m.toast("请输入包名"); return@btn }
+            runInjectPkg(resultTv, name, autoStart.isChecked)
+        }, LinearLayout.LayoutParams(0,
+            ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+        body.addView(btns, LinearLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT,
             ViewGroup.LayoutParams.WRAP_CONTENT).apply {
-            topMargin = dpc(ctx, 8); bottomMargin = dpc(ctx, 10)
+            topMargin = dpc(ctx, 10)
         })
-        val pkg = edit(ctx, "包名 (com.xxx.yyy)")
-        body.addView(pkg)
-        val byPkg = btn(ctx, "按包名注入") {
-            if (pkg.text.isBlank()) { m.toast("请输入包名"); return@btn }
-            runInject(resultTv) { NativeBridge.injectPkg(pkg.text.toString().trim()) }
+        m.dialog("注入 agent", body, listOf(Triple("关闭", true) {}))
+    }
+
+    /**
+     * 按 PID 注入：直接对指定 pid 注入，不需要先「选择进程」。
+     * 目标可以是 native ELF 等没有包名的进程（注入器会为 PID 直注入
+     * 把 agent 复制到公共可读目录供目标 dlopen）。
+     */
+    private fun injectPidDialog() {
+        val ctx = m.act
+        val body = vcol(ctx)
+        if (OState.pid > 0) {
+            body.addView(tv(ctx, "当前已选进程: [${OState.pid}] ${OState.pname}",
+                12f, 0xFF666666.toInt()).apply { setPadding(0, 0, 0, dpc(ctx, 6)) })
+        }
+        val pidInput = edit(ctx, "PID（十进制）")
+        body.addView(pidInput, LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT,
+            ViewGroup.LayoutParams.WRAP_CONTENT))
+        val resultTv = TextView(ctx).apply {
+            textSize = 12f
+            setTextColor(0xFF444444.toInt())
         }
         body.addView(resultTv, LinearLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT,
             ViewGroup.LayoutParams.WRAP_CONTENT).apply { topMargin = dpc(ctx, 6) })
-        body.addView(byPkg, LinearLayout.LayoutParams(
+
+        val btns = hrow(ctx)
+        btns.addView(btn(ctx, "注入当前进程") {
+            if (OState.pid <= 0) { m.toast("尚未选择进程"); return@btn }
+            pidInput.setText(OState.pid.toString())
+            runInject(resultTv, "") { NativeBridge.injectPid(OState.pid) }
+        }, LinearLayout.LayoutParams(0,
+            ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply { marginEnd = dpc(ctx, 6) })
+        btns.addView(btn(ctx, "按 PID 注入") {
+            val pid = pidInput.text.toString().trim().toIntOrNull()
+            if (pid == null || pid <= 0) { m.toast("PID 无效"); return@btn }
+            if (!runCatching { NativeBridge.procAlive(pid) }.getOrDefault(false)) {
+                m.toast("进程 $pid 不存在")
+                return@btn
+            }
+            runInject(resultTv, "") { NativeBridge.injectPid(pid) }
+        }, LinearLayout.LayoutParams(0,
+            ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+        body.addView(btns, LinearLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT,
-            ViewGroup.LayoutParams.WRAP_CONTENT).apply { topMargin = dpc(ctx, 8) })
-        m.dialog("注入 agent", body, listOf(Triple("关闭", true) {}))
+            ViewGroup.LayoutParams.WRAP_CONTENT).apply { topMargin = dpc(ctx, 10) })
+        m.dialog("按 PID 注入", body, listOf(Triple("关闭", true) {}))
     }
 
-    private fun runInject(resultTv: TextView?, call: () -> String) {
+    /**
+     * 按包名注入：先确认进程在运行，不在（或不存在）时可选拉起
+     * 应用，等 PID 出现后再执行注入。注入成功后按偏好自动连接
+     * SO 通道（注入器尚未准备好的情况下会提示连接超时）。
+     */
+    private fun runInjectPkg(resultTv: TextView?, pkg: String, autoStart: Boolean) {
+        m.toast("注入中…")
+        resultTv?.text = "注入中…"
+        Thread {
+            var pid = resolvePidByPkg(pkg)
+            if (pid <= 0) {
+                if (!autoStart) {
+                    m.onUi {
+                        resultTv?.setTextColor(0xFFD32F2F.toInt())
+                        resultTv?.text = "未找到 $pkg 的运行进程（未运行）"
+                    }
+                    m.toast("$pkg 未运行")
+                    return@Thread
+                }
+                val launch = runCatching {
+                    m.act.packageManager.getLaunchIntentForPackage(pkg)
+                }.getOrNull()
+                if (launch == null) {
+                    m.onUi {
+                        resultTv?.setTextColor(0xFFD32F2F.toInt())
+                        resultTv?.text = if (runCatching {
+                                m.act.packageManager.getApplicationInfo(
+                                    pkg, 0) }.isSuccess)
+                            "该包名没有可启动的界面，请手动打开应用后再注入"
+                        else "未安装该包名（或包名输入有误）"
+                    }
+                    return@Thread
+                }
+                m.onUi { resultTv?.text = "未运行，正在拉起 $pkg …" }
+                runCatching {
+                    launch.addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
+                    m.act.startActivity(launch)
+                }.onFailure {
+                    m.onUi {
+                        resultTv?.setTextColor(0xFFD32F2F.toInt())
+                        resultTv?.text = "拉起失败: " + (it.message ?: it.toString())
+                    }
+                    return@Thread
+                }
+                // 轮询等待进程出现（最多 20 秒）。每次重新解析，
+                // 避免选到先起来的多进程/子进程。
+                for (i in 0 until 40) {
+                    Thread.sleep(500)
+                    pid = resolvePidByPkg(pkg)
+                    if (pid > 0) break
+                }
+                if (pid <= 0) {
+                    m.onUi {
+                        resultTv?.setTextColor(0xFFD32F2F.toInt())
+                        resultTv?.text = "已拉起但 20 秒内未等到进程，请重试"
+                    }
+                    m.toast("未等到进程")
+                    return@Thread
+                }
+                m.onUi { resultTv?.text = "进程已启动 (pid=$pid)，注入中…" }
+            }
+            // 走注入器 -p 路径解析 PID，与原有行为保持一致。
+            finishInject(resultTv, pkg, runCatching {
+                NativeBridge.injectPkg(pkg)
+            }.getOrDefault("注入失败"))
+        }.start()
+    }
+
+    private fun runInject(resultTv: TextView?, pkg: String, call: () -> String) {
         m.toast("注入中…")
         if (resultTv != null) resultTv.text = "注入中…"
         Thread {
             val out = runCatching { call() }.getOrDefault("注入失败")
-            val ok = out.contains("Injection successful")
-            val brief = if (ok) {
-                val b = out.lineSequence().firstOrNull { it.contains("Base:") }
-                "注入成功 " + (b?.substringAfter("Base:")?.trim() ?: "")
-            } else out.lineSequence().lastOrNull { it.isNotBlank() }?.take(200)
-                ?: ""
-            m.onUi {
-                m.toast(if (ok) "注入成功" else "注入失败")
-                resultTv?.text = brief
-                resultTv?.setTextColor(
-                    if (ok) 0xFF1B8C3C.toInt() else 0xFFD32F2F.toInt())
-            }
+            finishInject(resultTv, pkg, out)
         }.start()
     }
+
+    /** 统一的注入结果处理：改写结果文本，并在成功后自动连接 SO 通道。 */
+    private fun finishInject(resultTv: TextView?, pkg: String, out: String) {
+        val ok = out.contains("Injection successful")
+        val brief = if (ok) {
+            val b = out.lineSequence().firstOrNull { it.contains("Base:") }
+            "注入成功 " + (b?.substringAfter("Base:")?.trim() ?: "")
+        } else out.lineSequence().lastOrNull { it.isNotBlank() }?.take(200)
+            ?: ""
+        m.onUi {
+            m.toast(if (ok) "注入成功" else "注入失败")
+            resultTv?.text = brief
+            resultTv?.setTextColor(
+                if (ok) 0xFF1B8C3C.toInt() else 0xFFD32F2F.toInt())
+        }
+        if (ok) {
+            val target = pkg.ifEmpty { OState.pkg.ifEmpty { OState.pname } }
+            SocketUtil.lastInjectedPkg = target
+            // 注入成功后自动把该进程设为当前进程（含冷启动刚拉起的场景）。
+            SocketUtil.selectProcessAfterInject(m, pkg, OState.pname)
+            SocketUtil.connectIfEnabled(m.act, target)
+        }
+    }
     // ── SO 通道：agent socket/hook 连接 ──
-    private fun soDialog(soValue: TextView) {
+
+    /**
+     * SO 通道操作面板：显式的「连接」/「断开」按钮，外加
+     * 「注入后自动连接」开关。状态行是只读显示，不做任何连接动作。
+     */
+    private fun soDialog() {
         val ctx = m.act
         val body = vcol(ctx)
         val status = TextView(ctx).apply {
-            text = runCatching { NativeBridge.socketStatus() }.getOrDefault("")
+            text = SocketUtil.statusText()
             textSize = 13f
             setTextColor(0xFF444444.toInt())
         }
         fun refreshStatus() {
-            status.text = runCatching { NativeBridge.socketStatus() }.getOrDefault("")
-            soValue.text = if (runCatching { NativeBridge.socketIsConnected() }
-                .getOrDefault(false)) "已连接" else "未连接"
+            val c = SocketUtil.isConnected()
+            val st = SocketUtil.statusText()
+            status.text = if (c) st else "未连接"
+            status.setTextColor(if (c) 0xFF1B8C3C.toInt()
+                                else 0xFFD32F2F.toInt())
+            refreshSoRow()
         }
         refreshStatus()
         body.addView(status)
+
+        val autoCb = CheckBox(ctx).apply {
+            text = "注入后自动连接 socket"
+            textSize = 13f
+            setTextColor(0xFF333333.toInt())
+            isChecked = SocketUtil.isAutoConnect(m.act)
+            setOnCheckedChangeListener { _, c ->
+                SocketUtil.setAutoConnect(m.act, c)
+                m.toast(if (c) "注入成功后将自动连接" else "已关闭自动连接")
+            }
+        }
+        body.addView(autoCb, LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT,
+            ViewGroup.LayoutParams.WRAP_CONTENT).apply {
+            topMargin = dpc(ctx, 6); bottomMargin = dpc(ctx, 2)
+        })
+
         val btns = hrow(ctx)
         btns.addView(btn(ctx, "连接") {
-            NativeBridge.socketSetTarget(
-                OState.pkg.ifEmpty { OState.pname })
-            NativeBridge.socketConnect()
-            m.toast("连接中…")
-            Thread { Thread.sleep(1200); m.onUi { refreshStatus() } }.start()
+            if (SocketUtil.isConnected()) {
+                m.toast("已连接")
+            } else {
+                SocketUtil.prepareTarget(
+                    OState.pkg.ifEmpty { OState.pname })
+                NativeBridge.socketConnect()
+                m.toast("连接中…")
+                Thread { Thread.sleep(1200); m.onUi { refreshStatus() } }
+                    .start()
+            }
         }, LinearLayout.LayoutParams(0,
             ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply { marginEnd = dpc(ctx, 6) })
         btns.addView(btn(ctx, "断开") {
-            NativeBridge.socketDisconnect()
-            Thread { Thread.sleep(400); m.onUi { refreshStatus() } }.start()
+            if (!SocketUtil.isConnected()) {
+                m.toast("当前未连接")
+            } else {
+                NativeBridge.socketDisconnect()
+                m.toast("已断开 SO 通道")
+                Thread { Thread.sleep(400); m.onUi { refreshStatus() } }.start()
+            }
         }, LinearLayout.LayoutParams(0,
             ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
         body.addView(btns, LinearLayout.LayoutParams(
@@ -690,6 +1019,26 @@ class OptionsPage(private val m: OverlayManager) : OverlayPage {
             ViewGroup.LayoutParams.WRAP_CONTENT).apply { topMargin = dpc(ctx, 8) })
         m.dialog("SO 通道", body, listOf(Triple("关闭", true) { refreshStatus() }))
     }
+
+    // ── SO 通道状态：绿=已连接，红=未连接 ──
+
+    /** 立即刷新 SO 通道状态行。 */
+    private fun refreshSoRow() {
+        if (!::soValue.isInitialized) return
+        val c = SocketUtil.isConnected()
+        val text = if (c) "已连接" else "未连接"
+        val color = if (c) 0xFF1B8C3C.toInt() else 0xFFD32F2F.toInt()
+        // 只在真正变化时 setText/setTextColor：半透明悬浮窗每次
+        // 无效化都会整窗重绘，无条件刷很费电。
+        if (text != lastSoText) { soValue.text = text; lastSoText = text }
+        if (color != lastSoColor) {
+            soValue.setTextColor(color)
+            lastSoColor = color
+        }
+    }
+
+    /** 由 OverlayManager 每秒轮询（仅当停在选项页时）。 */
+    fun onTick() = refreshSoRow()
 }
 
 // ── 搜索页 ──
@@ -952,21 +1301,40 @@ class SearchPage(private val m: OverlayManager) : OverlayPage {
 
     private fun saveChecked() {
         if (checked.isEmpty()) { m.toast("请先勾选结果"); return }
-        val type = OState.searchType
-        var n = 0
-        synchronized(OState.saved) {
-            for ((addr, raw) in cur) {
-                if (!checked.contains(addr)) continue
-                if (OState.saved.any { it.addr == addr }) continue
-                OState.saved.add(SavedRow(addr, type, MT.addr(addr),
-                    MT.fmt(type, raw), false))
-                n++
+        // 先让用户确认要按哪种内存格式保存（默认当前搜索类型）。
+        val first = checked.firstOrNull() ?: return
+        chooseMemType(m, OState.searchType, first) { type -> doSaveChecked(type) }
+    }
+
+    private fun doSaveChecked(type: Int) {
+        val addrs = checked.toList()
+        m.toast("保存中…")
+        Thread {
+            var n = 0
+            synchronized(OState.saved) {
+                for (addr in addrs) {
+                    if (OState.saved.any { it.addr == addr }) continue
+                    val size = MT.size(type)
+                    val bytes = runCatching {
+                        NativeBridge.memRead(OState.pid, addr, size)
+                    }.getOrNull()
+                    var raw = 0L
+                    if (bytes != null) {
+                        for (k in 0 until minOf(size, bytes.size))
+                            raw = raw or ((bytes[k].toLong() and 0xFF) shl (8 * k))
+                    }
+                    OState.saved.add(SavedRow(addr, type, MT.addr(addr),
+                        MT.fmt(type, raw), false))
+                    n++
+                }
             }
-        }
-        checked.clear()
-        refreshRows()
-        m.toast("已保存 $n 条")
-        m.onSavedChanged()
+            m.onUi {
+                checked.clear()
+                refreshRows()
+                m.toast(if (n > 0) "已保存 $n 条" else "这些地址已在保存列表中")
+                m.onSavedChanged()
+            }
+        }.start()
     }
 
     private fun editHit(addr: Long, raw: Long) {
@@ -1508,41 +1876,39 @@ class MemoryPage(private val m: OverlayManager) : OverlayPage {
 
     private fun saveChecked() {
         if (checkedAddrs.isEmpty()) { m.toast("请先勾选内存行"); return }
-        val addrs = checkedAddrs.sorted()
-        var n = 0
-        Thread {
-            synchronized(OState.saved) {
+        // 内存页默认按 DWORD 显示，但仍先询问要保存成哪种格式。
+        val first = checkedAddrs.minOrNull() ?: return
+        if (OState.pid <= 0) { m.toast("请先在选项页选择进程"); return }
+        chooseMemType(m, MT.DWORD, first) { type ->
+            val addrs = checkedAddrs.sorted()
+            m.toast("保存中…")
+            Thread {
+                var n = 0
                 for (addr in addrs) {
-                    if (OState.saved.any { it.addr == addr }) continue
-                    val raw = runCatching {
-                        NativeBridge.memRead(OState.pid, addr, 4)
-                    }.getOrNull() ?: ByteArray(4)
-                    var rv = 0L
-                    for (k in 0 until 4)
-                        rv = rv or (((raw.getOrNull(k)?.toLong()?.and(0xFF))
-                            ?: 0L) shl (8 * k))
-                    OState.saved.add(SavedRow(addr, MT.DWORD, MT.addr(addr),
-                        MT.fmt(MT.DWORD, rv), false))
-                    n++
+                    if (saveAddrAs(m, addr, type)) n++
                 }
-            }
-            m.onUi {
-                m.toast("已保存 $n 条")
-                m.onSavedChanged()
-            }
-        }.start()
+                m.onUi {
+                    m.toast(if (n > 0) "已保存 $n 条" else "这些地址已在保存列表中")
+                    m.onSavedChanged()
+                }
+            }.start()
+        }
     }
 
     // 跳转链接库：与 ImGui 一致，从 agent 拉取已加载库列表。
     private fun libsDialog() {
         val ctx = m.act
         val body = vcol(ctx)
+        val search = edit(ctx, "搜索库名 (如 libc / il2cpp)")
+        body.addView(search, LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT,
+            ViewGroup.LayoutParams.WRAP_CONTENT).apply { bottomMargin = dpc(ctx, 6) })
         val status = tv(ctx, "准备连接 SO 通道…", 12f, 0xFF999999.toInt())
         body.addView(status)
         val list = vcol(ctx)
         body.addView(ScrollView(ctx).apply { addView(list) },
             LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT,
-                dpc(ctx, 260)).apply { topMargin = dpc(ctx, 6) })
+                dpc(ctx, 250)).apply { topMargin = dpc(ctx, 6) })
         m.dialog("跳转链接库", body, listOf(Triple("关闭", true) {}))
         Thread {
             var connected = runCatching { NativeBridge.socketIsConnected() }
@@ -1576,23 +1942,56 @@ class MemoryPage(private val m: OverlayManager) : OverlayPage {
                 if (f.size < 2) null
                 else Pair(MT.parseHex(f[0]) ?: 0L, f[1])
             }.filter { it.first != 0L }
+
+            // 库名过滤：按基名匹配（用户只会记得 libxxx.so，不会记得目录）。
+            val baseNames = libs.map { it.second.substringAfterLast('/') }
+            fun render(filter: String) {
+                list.removeAllViews()
+                val kw = filter.trim()
+                val shown = ArrayList<Int>(libs.size)
+                for (i in libs.indices) {
+                    if (kw.isEmpty() || baseNames[i].contains(kw, true)) shown.add(i)
+                }
+                if (shown.isEmpty()) {
+                    list.addView(tv(ctx, "无匹配链接库", 13f, 0xFF999999.toInt()))
+                } else {
+                    for (i in shown.take(200)) {
+                        val addr = libs[i].first
+                        list.addView(tv(ctx,
+                            MT.addr(addr) + "  " + baseNames[i],
+                            13f, 0xFF1565C0.toInt(), true).apply {
+                            setPadding(0, dpc(ctx, 6), 0, dpc(ctx, 6))
+                            setOnClickListener {
+                                MemoryPage.jumpTo(m, addr)
+                                // 跳转后关掉链接库弹窗，直接看到内存页。
+                                m.dismissDialogs()
+                            }
+                        })
+                    }
+                }
+                status.text = if (kw.isEmpty())
+                    "共 ${libs.size} 个库，点击跳转"
+                else
+                    "匹配 ${shown.size} / ${libs.size} 个库（最多显示 200）"
+                status.setTextColor(0xFF999999.toInt())
+            }
+
+            search.addTextChangedListener(object : TextWatcher {
+                override fun afterTextChanged(s: Editable?) {}
+                override fun beforeTextChanged(s: CharSequence?, a: Int,
+                                               b: Int, c: Int) {}
+                override fun onTextChanged(s: CharSequence?, a: Int, b: Int, c: Int) {
+                    render(s?.toString() ?: "")
+                }
+            })
+
             m.onUi {
                 if (libs.isEmpty()) {
                     status.text = if (resp.startsWith("错误")) resp.take(200)
                                   else "未获取到链接库"
                     status.setTextColor(0xFFD32F2F.toInt())
                 } else {
-                    status.text = "共 ${libs.size} 个库，点击跳转"
-                    status.setTextColor(0xFF999999.toInt())
-                    list.removeAllViews()
-                    for ((addr, name) in libs.take(200)) {
-                        list.addView(tv(ctx,
-                            MT.addr(addr) + "  " + name.substringAfterLast('/'),
-                            13f, 0xFF1565C0.toInt(), true).apply {
-                            setPadding(0, dpc(ctx, 6), 0, dpc(ctx, 6))
-                            setOnClickListener { MemoryPage.jumpTo(m, addr) }
-                        })
-                    }
+                    render(search.text.toString())
                 }
             }
         }.start()
@@ -1852,7 +2251,7 @@ class ScriptPage(private val m: OverlayManager) : OverlayPage {
             0xFF999999.toInt()).apply {
             setPadding(dpc(ctx, 8), 0, dpc(ctx, 8), 0)
         })
-        editor = EditText(ctx).apply {
+        editor = ClipboardEditText(ctx).apply {
             gravity = Gravity.TOP
             minLines = 12
             textSize = 13f
@@ -1881,7 +2280,32 @@ class ScriptPage(private val m: OverlayManager) : OverlayPage {
             textSize = 12f
             setTextColor(0xFF444444.toInt())
             setTextIsSelectable(true)
+            // 长按结果区可复制输出（与脚本内容分开，两者都要能复制）。
+            setOnLongClickListener {
+                val t = text.toString()
+                if (t.isNotEmpty() && t != "执行中…") {
+                    copyText(ctx, t)
+                    m.toast("已复制输出 ${t.length} 字符")
+                }
+                true
+            }
         }
+        // 复制脚本：优先复制选中的片段，没有选中就复制全文。
+        btns.addView(btn(ctx, "复制") {
+            val sel = editor.selectionStart.coerceAtLeast(0) to
+                editor.selectionEnd.coerceAtLeast(0)
+            val text = if (sel.first != sel.second)
+                editor.text.substring(sel.first, sel.second)
+            else editor.text.toString()
+            if (text.isEmpty()) {
+                m.toast("脚本为空")
+            } else {
+                copyText(ctx, text)
+                m.toast("已复制 ${text.length} 字符")
+            }
+        }, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply {
+            marginEnd = dpc(ctx, 6)
+        })
         btns.addView(btn(ctx, "执行") {
             if (!runCatching { NativeBridge.socketIsConnected() }.getOrDefault(false)) {
                 m.toast("请先在选项页连接 SO 通道")

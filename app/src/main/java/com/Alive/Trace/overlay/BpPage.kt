@@ -87,7 +87,7 @@ class BpPage(private val m: OverlayManager) : OverlayPage {
             gravity = Gravity.CENTER_VERTICAL
             setPadding(0, dpc(ctx, 8), 0, 0)
         }
-        addrInput = EditText(ctx).apply {
+        addrInput = ClipboardEditText(ctx).apply {
             hint = "地址 (hex)"
             textSize = 14f
             isSingleLine = true
@@ -133,7 +133,7 @@ class BpPage(private val m: OverlayManager) : OverlayPage {
             gravity = Gravity.CENTER_VERTICAL
             setPadding(0, dpc(ctx, 6), 0, 0)
         }
-        val clrInput = EditText(ctx).apply {
+        val clrInput = ClipboardEditText(ctx).apply {
             hint = "要清除的地址 (hex)"
             textSize = 14f
             isSingleLine = true
