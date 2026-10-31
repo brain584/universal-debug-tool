@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "atrace": {
+      "type": "streamableHttp",
+      "url": "http://127.0.0.1:28472/mcp"
+    }
+  }
+}

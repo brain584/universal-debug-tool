@@ -60,6 +60,30 @@ class MainActivity : AppCompatActivity() {
         permissionCard = findViewById(R.id.permission_card)
         aboutCard = findViewById(R.id.about_card)
 
+        // native 侧初始化（注入器/agent/配置目录）。
+        // onCreate 只恢复桥 → 通过 MCP/adb 注入会报"配置目录未初始化"。
+        runCatching {
+            val injPath = ensureInjectorExtracted()
+            val agPath = ensureAgentExtracted()
+            nativeSetInjectorInfo(injPath, agPath)
+            nativeSetZptPath(ensureZptExtracted())
+            nativeSetConfigDir(filesDir.absolutePath)
+            Log.i("ATrace", "native init: inj=$injPath agent=$agPath")
+        }
+
+        // adb 调试桥：**在 App 启动时就恢复**，不依赖悬浮窗。
+        // 需求明确要求「该模式下手机不需要打开悬浮窗」——电脑只要 adb forward 连进来即可。
+        // （之前写在 startOverlay() 里，必须先开悬浮窗才生效，与需求不符，已移到这里。）
+        runCatching {
+            val r = com.Alive.Trace.overlay.AdbBridge.applyPref(this)
+            Log.i("ATrace", "adb bridge(启动时): $r")
+        }
+        // 手机本地 MCP（HTTP）：受「MCP 工具通道」开关控制，App 启动即恢复。
+        runCatching {
+            val r = com.Alive.Trace.overlay.McpHttpServer.applyPref(this)
+            Log.i("ATrace", "local mcp(启动时): $r")
+        }
+
         // 头像：打开关于页。
         findViewById<View>(R.id.avatar_btn).setOnClickListener {
             startActivity(Intent(this, AboutActivity::class.java))
@@ -187,9 +211,18 @@ class MainActivity : AppCompatActivity() {
         val injectorPath = ensureInjectorExtracted()
         val agentPath = ensureAgentExtracted()
         nativeSetInjectorInfo(injectorPath, agentPath)
+        // 零 ptrace 注入器（assets/zpt）
+        nativeSetZptPath(ensureZptExtracted())
         nativeSetConfigDir(filesDir.absolutePath)
 
         overlayManager!!.show()
+
+        // adb 调试桥：如果之前在选项页勾选了「电脑 cmd 编辑执行 Lua」，
+        // 这里恢复监听（App 重启后仍然可用，不需要再手动去勾一次）。
+        runCatching {
+            val r = com.Alive.Trace.overlay.AdbBridge.applyPref(this)
+            Log.i("ATrace", "adb bridge: $r")
+        }
 
         statusCard.setRunning(true)
         overlayStartElapsed = SystemClock.elapsedRealtime()
@@ -340,6 +373,27 @@ class MainActivity : AppCompatActivity() {
     }
 
     // Native 方法（后端：注入器路径 / 配置目录）。
+    // 零 ptrace 注入器（assets/zpt）：解压到 files 目录并赋予执行权限。
+    private fun ensureZptExtracted(): String {
+        val target = File(filesDir, "zpt")
+        return try {
+            // 【踩过的坑】原来写的是"只在文件不存在时解压"：
+            //     if (!target.exists() || target.length() == 0L) { 解压 }
+            // 结果**换新版 APK 后，filesDir 里的旧 zpt 一直留着、永远不更新**，
+            // 用户装上新版仍在跑旧注入器（实测：日志文案还是旧版的，白测了几轮）。
+            // 现在每次都重新解压 —— 文件只有几十 KB，代价可以忽略。
+            assets.open("zpt").use { input ->
+                target.outputStream().use { output -> input.copyTo(output) }
+            }
+            target.setExecutable(true, false)
+            target.absolutePath
+        } catch (e: Exception) {
+            Log.e("ATrace", "extract zpt failed: ${e.message}")
+            ""
+        }
+    }
+
     private external fun nativeSetInjectorInfo(injectorPath: String, agentPath: String)
+    private external fun nativeSetZptPath(path: String)
     private external fun nativeSetConfigDir(dir: String)
 }

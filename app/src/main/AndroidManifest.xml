@@ -4,6 +4,22 @@
 
     <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
 
+    <!-- adb 调试桥（脚本页的「电脑 cmd 编辑执行 Lua」与 MCP 工具通道）：
+         手机侧监听 127.0.0.1:28471，电脑用 `adb forward tcp:28471 tcp:28471` 连进来。
+         只绑 loopback，不对局域网暴露；但 Android 要求声明 INTERNET 才能创建 socket。 -->
+    <uses-permission android:name="android.permission.INTERNET" />
+
+    <!-- 存储访问（脚本页的「选择脚本并执行」需要）：
+         用户要求自己写文件浏览器、不调系统文件管理器，因此必须能直接遍历 /sdcard。
+         · Android 11+：任意文件访问只能靠用户手动授予「所有文件访问权限」
+           （MANAGE_EXTERNAL_STORAGE），代码里用 Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION
+           引导用户去开，开完返回即可用，不再偷偷走 root。
+         · Android 10 及以下：仍用运行时权限 READ_EXTERNAL_STORAGE。 -->
+    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE"
+        android:maxSdkVersion="32" />
+    <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE"
+        tools:ignore="ScopedStorage" />
+
     <!-- Android 11+ 包可见性：本工具需要枚举已安装应用（进程列表显示
          应用名/图标），并在按包名注入时拉起未运行的应用，因此需要声明
          对「带启动图标的应用」的查询可见性；否则

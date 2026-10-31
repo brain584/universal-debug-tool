@@ -1,0 +1,555 @@
+[
+ {
+  "name": "run_lua",
+  "description": "在目标进程的 LuaJIT 里执行一段 Lua 脚本，返回本次执行的结果与 print 输出。目标内注入了宿主 API：getBase / hookCPU / hookfunc / removehook / call / msleep / read* / write* / regsOf / setReg / print / api() / help()。**第一次用请先执行 api() 或 help()**，它会返回全部函数的签名(sig)、返回值(ret)、说明(desc) 和示例(example)；api(\"hookfunc\") 可单查一个。",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "script": {
+     "type": "string"
+    }
+   },
+   "required": [
+    "script"
+   ]
+  }
+ },
+ {
+  "name": "agent_status",
+  "description": "查询手机端 agent socket 是否已连接（脚本执行的前提）",
+  "inputSchema": {
+   "type": "object",
+   "properties": {},
+   "required": []
+  }
+ },
+ {
+  "name": "list_processes",
+  "description": "列出设备上的进程（pid 与名称）",
+  "inputSchema": {
+   "type": "object",
+   "properties": {},
+   "required": []
+  }
+ },
+ {
+  "name": "list_modules",
+  "description": "列出目标进程已加载的模块（需先连接 agent）",
+  "inputSchema": {
+   "type": "object",
+   "properties": {},
+   "required": []
+  }
+ },
+ {
+  "name": "mem_read",
+  "description": "读取目标进程内存，返回十六进制字符串",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "pid": {
+     "type": "integer"
+    },
+    "addr": {
+     "type": "string"
+    },
+    "len": {
+     "type": "integer"
+    }
+   },
+   "required": [
+    "pid",
+    "addr",
+    "len"
+   ]
+  }
+ },
+ {
+  "name": "mem_write",
+  "description": "写目标进程内存，data 为十六进制字符串（长度需为偶数）",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "pid": {
+     "type": "integer"
+    },
+    "addr": {
+     "type": "string"
+    },
+    "data": {
+     "type": "string"
+    }
+   },
+   "required": [
+    "pid",
+    "addr",
+    "data"
+   ]
+  }
+ },
+ {
+  "name": "mem_page",
+  "description": "按页读取目标进程内存并附带反汇编（App 侧 capstone，不占 agent 体积）。每行 4 字节：地址 值 汇编；rows 默认 16（64B），最大 256（1KB）。addr 支持：0x1234 / 1234（十六进制/十进制）、libxxx.so+0x1234、libxxx.so-0x10、0x1000+0x20（模块名支持短名/全路径/包含匹配，需 agent 已连接）。",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "pid": {
+     "type": "integer"
+    },
+    "addr": {
+     "type": "string"
+    },
+    "rows": {
+     "type": "integer"
+    },
+    "disasm": {
+     "type": "boolean"
+    }
+   },
+   "required": [
+    "pid",
+    "addr"
+   ]
+  }
+ },
+ {
+  "name": "inject_pid",
+  "description": "把 agent 注入到指定进程（需要 root）。默认走传统 ptrace 注入器；zero=true 时走**零 ptrace**（data-only GOT 劫持，不建立 ptrace 关系，TracerPid 不变）。成功后会自动记录目标并尝试连接 agent，随后就能用 run_lua / list_modules / bp_* / search_* / art_*。\nautorun（可选）：注入+连接成功后自动执行的 Lua 源码；不传时若 <filesDir>/scripts/autorun.lua 存在则执行它（用 get_autorun / set_autorun 管理）。autorun 失败不会改变注入成功的结果，但会在返回里说明失败原因。\n**no_autorun=true：本次注入跳过 autorun**（不读已存文件，也不改动它）；想永久关闭用 set_autorun {script:\"\"} 清除。\n若返回「⚠ 旧 agent 仍占用」，说明目标进程里的旧 agent 没退出（固定 socket 名 + 不支持 detach）：先 `adb shell am force-stop <pkg>` 或手动重启目标 App，再重新 inject_pid。",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "pid": {
+     "type": "integer"
+    },
+    "zero": {
+     "type": "boolean"
+    },
+    "autorun": {
+     "type": "string"
+    },
+    "no_autorun": {
+     "type": "boolean"
+    },
+    "stealth": {
+     "type": "boolean"
+    },
+    "memfd": {
+     "type": "boolean"
+    },
+    "hide_maps": {
+     "type": "boolean"
+    },
+    "hide_solist": {
+     "type": "boolean"
+    },
+    "dlclose_hide": {
+     "type": "boolean"
+    },
+    "deep_obfuscate": {
+     "type": "boolean"
+    },
+    "no_copy": {
+     "type": "boolean"
+    }
+   },
+   "required": [
+    "pid"
+   ]
+  }
+ },
+ {
+  "name": "launch_and_inject",
+  "description": "**拉起目标 App，并在它刚起来时立刻注入**（需要 root）。很多目标启动后几秒就完成初始化/开始自检，等它跑起来再注入会错过最干净的窗口；本工具把「force-stop → am start → 轮询 pid → 注入 → 连 agent → autorun」串成一步，并返回「启动→拿到 pid」和「启动→注入完成」两个耗时。\n参数：pkg（包名，必填）；zero=零 ptrace；restart 默认 true（先 force-stop 拿全新进程）；wait_ms 默认 8000（等进程出现的上限）；activity 可选（显式组件，如 pkg/.MainActivity）；autorun 可选（注入成功后的 Lua，失败不改变注入结果）；no_autorun=true 本次跳过 autorun（不读/不改已存脚本）。\n注意：force-stop 会丢掉目标当前状态；只想注入已运行的进程请用 inject_pid。",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "pkg": {
+     "type": "string"
+    },
+    "zero": {
+     "type": "boolean"
+    },
+    "restart": {
+     "type": "boolean"
+    },
+    "wait_ms": {
+     "type": "integer"
+    },
+    "activity": {
+     "type": "string"
+    },
+    "autorun": {
+     "type": "string"
+    },
+    "no_autorun": {
+     "type": "boolean"
+    },
+    "stealth": {
+     "type": "boolean"
+    },
+    "memfd": {
+     "type": "boolean"
+    },
+    "hide_maps": {
+     "type": "boolean"
+    },
+    "hide_solist": {
+     "type": "boolean"
+    },
+    "dlclose_hide": {
+     "type": "boolean"
+    },
+    "deep_obfuscate": {
+     "type": "boolean"
+    },
+    "no_copy": {
+     "type": "boolean"
+    }
+   },
+   "required": [
+    "pkg"
+   ]
+  }
+ },
+ {
+  "name": "get_autorun",
+  "description": "读取「注入后自动执行脚本」：固定路径 <filesDir>/scripts/autorun.lua。未设置（文件不存在）时返回提示而不是报错。",
+  "inputSchema": {
+   "type": "object",
+   "properties": {},
+   "required": []
+  }
+ },
+ {
+  "name": "set_autorun",
+  "description": "写入「注入后自动执行脚本」：固定路径 <filesDir>/scripts/autorun.lua（最大 1MB）。写完后每次 inject_pid 成功且 agent 连上都会自动执行；inject_pid 的 autorun 参数可临时覆盖（不落盘）；no_autorun=true 可单次跳过。**script 传空串 = 清除 autorun**（删除文件，之后注入不再自动执行；这是关闭 autorun 的正规入口）。",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "script": {
+     "type": "string"
+    }
+   },
+   "required": [
+    "script"
+   ]
+  }
+ },
+ {
+  "name": "search_start",
+  "description": "启动精确/范围搜索（异步，立即返回；用 search_status 看进度、search_page 读结果）。value 支持 100 / 0x64 / 10~20（范围）；type 默认 dword（dword/float/qword/word/byte/double）。areas 省略=全部内存，可传区域名数组（如 [\"stack\",\"c_heap\"]）或整数掩码数组。结果上限 200000 条（达到时 status 会带「(已达上限)」）。注意：与手机悬浮窗共用同一份结果集，新搜索会覆盖旧结果。",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "pid": {
+     "type": "integer"
+    },
+    "value": {
+     "type": "string"
+    },
+    "type": {
+     "type": "string"
+    },
+    "areas": {
+     "type": "array"
+    }
+   },
+   "required": [
+    "pid",
+    "value"
+   ]
+  }
+ },
+ {
+  "name": "search_status",
+  "description": "查询搜索状态（三合一）：running（后台是否还在跑）/ count（已完成结果数）/ status（native 的中文状态文本，如「精确搜索完成: 37 个结果 (耗时 2.0s)」）。running=false 且 status 不再是「搜索中.../过滤中.../改善中...」即表示结束。",
+  "inputSchema": {
+   "type": "object",
+   "properties": {},
+   "required": []
+  }
+ },
+ {
+  "name": "search_page",
+  "description": "分页读取搜索结果，每行「地址 值 [ascii]」。offset 默认 0，count 默认 20、最大 60。搜索进行中也能调用：只返回已完成的部分；还没有结果时给出明确提示而不是失败。尾部会注明 total/running 与下一页 offset。",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "offset": {
+     "type": "integer"
+    },
+    "count": {
+     "type": "integer"
+    },
+    "ascii": {
+     "type": "boolean"
+    }
+   },
+   "required": []
+  }
+ },
+ {
+  "name": "search_refine",
+  "description": "精确「改善」（异步）：在现有结果里只保留当前值等于 value 的地址。不支持范围写法（10~20 只能用于 search_start）；type 省略时沿用本次/上次搜索类型。",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "value": {
+     "type": "string"
+    },
+    "type": {
+     "type": "string"
+    }
+   },
+   "required": [
+    "value"
+   ]
+  }
+ },
+ {
+  "name": "search_reset",
+  "description": "清空搜索结果与状态。注意：这不会打断正在后台跑的搜索线程，它结束时仍会把结果写回（所以清空前先确认 running=false）。",
+  "inputSchema": {
+   "type": "object",
+   "properties": {},
+   "required": []
+  }
+ },
+ {
+  "name": "fuzzy_start",
+  "description": "模糊搜索初始化（异步快照）：按 type 对目标进程做一次全量取值快照（上限 1000000 条），之后用 fuzzy_filter 按「值的变化」反复筛选。与手机 UI 共用同一份结果集。",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "pid": {
+     "type": "integer"
+    },
+    "type": {
+     "type": "string"
+    },
+    "areas": {
+     "type": "array"
+    }
+   },
+   "required": [
+    "pid"
+   ]
+  }
+ },
+ {
+  "name": "fuzzy_filter",
+  "description": "模糊搜索「改善」（异步）：比较快照值与当前值。op 支持 0/unchanged=未变化、1/changed=有变化、2/increased=变大、3/decreased=变小（整数或字符串均可）。可反复调用逐步收敛。",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "op": {
+     "type": "string"
+    }
+   },
+   "required": [
+    "op"
+   ]
+  }
+ },
+ {
+  "name": "art_hook",
+  "description": "Hook 一个 Java/ART 方法（LSPlant，运行期替换，不改 dex）。需要 agent 已注入并连接。\nmode=log（默认）：只记日志，不影响原方法；命中记录用 agent_logs 读取。\nmode=replace：直接返回 value（原方法不执行；value_type=number/boolean/string/null 指定类型，默认自动）。\nmode=script：执行自定义 Lua 回调体（可用 ctx.this / ctx.args / ctx.id；return 值覆盖返回值，return nil 则透传调原方法）。",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "class": {
+     "type": "string"
+    },
+    "method": {
+     "type": "string"
+    },
+    "signature": {
+     "type": "string"
+    },
+    "mode": {
+     "type": "string"
+    },
+    "value": {
+     "type": "string"
+    },
+    "value_type": {
+     "type": "string"
+    },
+    "script": {
+     "type": "string"
+    }
+   },
+   "required": [
+    "class",
+    "method"
+   ]
+  }
+ },
+ {
+  "name": "art_unhook",
+  "description": "卸载由 art_hook 安装的 Java hook（按 id）。",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "id": {
+     "type": "integer"
+    }
+   },
+   "required": [
+    "id"
+   ]
+  }
+ },
+ {
+  "name": "art_hooks",
+  "description": "列出当前所有 Java hook（id/class/method/signature/mode）。",
+  "inputSchema": {
+   "type": "object",
+   "properties": {},
+   "required": []
+  }
+ },
+ {
+  "name": "agent_logs",
+  "description": "读取目标进程内 agent 的 Lua 日志（含 art_hook 的命中记录、run_lua 的 print）。可选 lines（默认 100，最大 400），返回最后 N 行。",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "lines": {
+     "type": "integer"
+    }
+   },
+   "required": []
+  }
+ },
+ {
+  "name": "bp_status",
+  "description": "查询硬件断点服务状态：是否运行、目标 pid、状态文本、最近一条 OK/ERR",
+  "inputSchema": {
+   "type": "object",
+   "properties": {},
+   "required": []
+  }
+ },
+ {
+  "name": "bp_start",
+  "description": "启动硬件断点服务（需要 root）。pid 省略时用当前 agent 连接的目标进程",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "pid": {
+     "type": "integer"
+    }
+   },
+   "required": []
+  }
+ },
+ {
+  "name": "bp_stop",
+  "description": "停止硬件断点服务并清理所有断点",
+  "inputSchema": {
+   "type": "object",
+   "properties": {},
+   "required": []
+  }
+ },
+ {
+  "name": "bp_set",
+  "description": "下硬件断点。addr 可直接给地址，也可用 module+offset（如 module=libtutorial.so, offset=0x1234）。type: x=执行(rw=读写数据)，默认 x；len: 1/2/4/8，执行断点用 4",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "addr": {
+     "type": "string"
+    },
+    "module": {
+     "type": "string"
+    },
+    "offset": {
+     "type": "string"
+    },
+    "type": {
+     "type": "string"
+    },
+    "len": {
+     "type": "integer"
+    }
+   },
+   "required": []
+  }
+ },
+ {
+  "name": "bp_clear",
+  "description": "清除指定地址的断点",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "addr": {
+     "type": "string"
+    }
+   },
+   "required": [
+    "addr"
+   ]
+  }
+ },
+ {
+  "name": "bp_clear_all",
+  "description": "清除所有断点",
+  "inputSchema": {
+   "type": "object",
+   "properties": {},
+   "required": []
+  }
+ },
+ {
+  "name": "bp_hits",
+  "description": "取最近的断点命中记录，每行 12 段：\npc|tid|addr|反汇编|sp|栈|寄存器|次数|区域|模块|类型|长度\n其中 pc=真实命中指令地址（执行断点==addr；读写监视点=访问该数据的那条指令），addr=断点地址，disasm 以 pc 为基准。\n**java=true（默认）且 agent 已连接时**，每行末尾会追加第 13 段：\n`|java=<Java 帧1> <- <Java 帧2> <- ...`（按 hit 行的 tid 查该线程的 Java 栈；纯 native 线程没有 Java 栈，则该段不出现）。这就是硬件断点的「Java 层」信息。java=false 可关掉（少一次 agent 往返）。",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "max": {
+     "type": "integer"
+    },
+    "java": {
+     "type": "boolean"
+    }
+   },
+   "required": []
+  }
+ },
+ {
+  "name": "bp_java_stack",
+  "description": "按 **tid** 查询某个线程的完整 Java 调用栈（一行一帧 className|method|file|line|native）。\n典型用法：`bp_hits` 每行第 2 段就是 tid，拿它来这里看完整栈（bp_hits 只带前 8 帧摘要）。\n需要 agent 已连接（Java 栈要由目标进程内的 agent 问 ART）；纯 native 线程（未被 ART Attach）会报「不是 Java 线程」。",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "tid": {
+     "type": "integer"
+    },
+    "max": {
+     "type": "integer"
+    }
+   },
+   "required": [
+    "tid"
+   ]
+  }
+ },
+ {
+  "name": "bp_wait",
+  "description": "等待断点命中（轮询最多 timeout_sec 秒），常用于「下断点→等命中→看寄存器/栈」",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "timeout_sec": {
+     "type": "integer"
+    },
+    "max": {
+     "type": "integer"
+    }
+   },
+   "required": []
+  }
+ }
+]

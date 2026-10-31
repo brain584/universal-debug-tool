@@ -16,6 +16,11 @@ struct InjectorConfig {
     bool dlcloseHide = false;   // 通过 patch soinfo + dlclose 隐藏（替代 hideSolist）
     bool copyToPrivate = true;  // 复制到目标进程私有目录（避免SELinux限制）
     bool deepObfuscate = false; // 注入后进行深度 ELF 混淆（破坏 dynamic/strtab/symtab 等）
+
+    // App 私有目录生成，注入器读取后经远程内存写入目标进程，再调用
+    // agent 导出的 AgentStartWithAuth() 启动带认证的 socket 监听。
+    std::string keyFile;        // 44 字节（32 key + 12 nonce）的密钥文件路径
+    uint32_t clientUid = 0;     // 允许直连的 GUI uid（relay 走 root，另算）
 };
 
 class Injector {
@@ -54,6 +59,9 @@ private:
 
     // 调用 JNI_OnLoad
     bool callEntryPoint(uintptr_t handle, const ElfParser& elf);
+    // 通过远程内存把认证材料交给 agent 并启动带认证的 socket 监听。
+    // 失败时通道不可用（不会降级为无密钥监听）。
+    bool startAgentWithAuth(const ElfParser& elf, const InjectorConfig& config);
     
     // 获取 JavaVM
     uintptr_t getJavaVM();

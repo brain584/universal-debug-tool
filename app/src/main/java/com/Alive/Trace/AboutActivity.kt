@@ -29,6 +29,8 @@ class AboutActivity : AppCompatActivity() {
         Lib("xDL", "so 遍历、基址解析", "MIT", "https://github.com/hexhacking/xDL"),
         Lib("LuaJIT", "脚本引擎", "MIT", "https://github.com/LuaJIT/LuaJIT"),
         Lib("Dobby", "inline hook", "Apache-2.0", "https://github.com/jmpews/Dobby"),
+        Lib("LSPlant", "Java 方法 hook（ART 反射/插桩）", "LGPL-3.0",
+            "https://github.com/LSPosed/LSPlant"),
         Lib("AndroidInject", "ptrace 注入器基础", "详见上游", "https://github.com/niqiuqiux/AndroidInject"),
         Lib("MemorySearch", "内存读写 / 搜索（剔除 Keystone）",
             "MIT", "https://github.com/Aboy-g/MemorySearch"),

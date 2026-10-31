@@ -464,16 +464,71 @@ static void ReadStack(uint64_t sp, uint64_t fp, uint64_t lr, uint64_t pc,
     close(fd);
 }
 
+// 该地址是否落在目标进程的可执行映射里。
+// 用途：判断 perf 采样到的 PC 是否可信（P0-5）。每次命中查一次 maps，
+// 断点命中不是高频路径，开销可接受。
+static bool IsExecutableAddress(uint64_t addr) {
+    if (addr == 0) return false;
+    char path[64];
+    snprintf(path, sizeof(path), "/proc/%d/maps", (int)g_target);
+    FILE* f = fopen(path, "r");
+    if (!f) return false;
+    char line[512];
+    bool exec = false;
+    while (fgets(line, sizeof(line), f)) {
+        unsigned long long s = 0, e = 0;
+        char perms[8] = {0};
+        if (sscanf(line, "%llx-%llx %7s", &s, &e, perms) != 3) continue;
+        if (addr >= s && addr < e) {
+            exec = (perms[2] == 'x');
+            break;
+        }
+    }
+    fclose(f);
+    return exec;
+}
+
+// ── 命中记录字段语义（P0-5 修复后的唯一权威定义）─────────────────────
+//   addr = 断点地址（perf_event_attr.bp_addr，= 用户/UI/API 下断时给的地址）
+//   pc   = 真实命中指令地址：
+//            · 执行断点(x, kHwBreakpointX)：恒等于 addr —— 硬件执行断点按
+//              「指令地址」匹配，命中即该地址上的指令；
+//            · 读/写/读写监视点(r/w/rw)：访问该数据地址的那条指令地址。
+//   旧实现直接把 perf 采样的 PC 原样写进 `pc=`，部分内核上 REGS_USER/INTR
+//   的 PC 会取到 0 或别的寄存器值，导致下游「用 pc 反汇编」得到的指令与
+//   addr 对不上（现象：addr 是一条 cmp，disasm 却是 ldr/其它指令）。
+//   现在：x 断点强制用 addr 作为 pc；r/w 断点对采样 PC 做可执行映射校验，
+//   不可信时置 0（下游跳过反汇编），绝不把数据地址当指令地址。
 static void EmitHit(const BpEvent& ev, uint32_t tid,
                     const std::vector<uint64_t>& regs) {
-    uint64_t pc = (kPcRegIndex >= 0 && kPcRegIndex < (int)regs.size())
-                      ? regs[kPcRegIndex] : 0;
+    uint64_t sampledPc = (kPcRegIndex >= 0 && kPcRegIndex < (int)regs.size())
+                             ? regs[kPcRegIndex] : 0;
     uint64_t sp = (kSpRegIndex >= 0 && kSpRegIndex < (int)regs.size())
                       ? regs[kSpRegIndex] : 0;
     uint64_t fp = (kFpRegIndex >= 0 && kFpRegIndex < (int)regs.size())
                       ? regs[kFpRegIndex] : 0;
     uint64_t lr = (kLrRegIndex >= 0 && kLrRegIndex < (int)regs.size())
                       ? regs[kLrRegIndex] : 0;
+
+    uint64_t pc = sampledPc;
+    if (ev.type == kHwBreakpointX) {
+        if (sampledPc != ev.addr) {
+            __android_log_print(
+                ANDROID_LOG_WARN, "ATraceBP",
+                "x-hit: sampled_pc=0x%llx != bp_addr=0x%llx；"
+                "按语义采用 bp_addr 作为命中指令地址",
+                (unsigned long long)sampledPc, (unsigned long long)ev.addr);
+        }
+        pc = ev.addr;
+    } else if (pc != 0 && !IsExecutableAddress(pc)) {
+        __android_log_print(
+            ANDROID_LOG_WARN, "ATraceBP",
+            "watch-hit: sampled_pc=0x%llx 不在任何可执行映射（采样异常）；"
+            "pc 置 0，addr=0x%llx 不变",
+            (unsigned long long)pc, (unsigned long long)ev.addr);
+        pc = 0;
+    }
+
     std::vector<uint64_t> stack;
     ReadStack(sp, fp, lr, pc, stack);
 
@@ -484,8 +539,12 @@ static void EmitHit(const BpEvent& ev, uint32_t tid,
                        "HIT addr=0x%llx tid=%u pc=0x%llx bpt=%d blen=%d",
                        (unsigned long long)ev.addr, tid,
                        (unsigned long long)pc, ev.type, ev.len);
+    // 寄存器 dump 里**不再重复输出 pc**：它已经作为本行元数据出现，旧实现
+    // 会在 x0..x30 之后再打一个 "pc="，解析方必须靠"第一次出现的 pc 才是
+    // 元数据"来区分（BpService 的 seen_pc 变通），很容易被误当成命中地址。
     for (int i = 0; i < (int)regs.size() &&
                     pos < (int)sizeof(line) - 96; ++i) {
+        if (i == kPcRegIndex) continue;
         pos += snprintf(line + pos, sizeof(line) - (size_t)pos,
                         " %s=0x%llx", RegName(i),
                         (unsigned long long)regs[i]);
@@ -517,39 +576,83 @@ static void DrainEvent(BpEvent& ev) {
         if (tail + hdr.size > head) break;
 
         if (hdr.type == kPerfRecordSample) {
-            // 记录布局：
+            // 记录布局（按 sample_type 位序）：
             //   header(8) + pid(4) + tid(4)
             //   + [REGS_USER: abi(8) + regs(N*8)]
             //   + [REGS_INTR: abi(8) + regs(N*8)]   （内核写入时才有）
-            // 必须跳过每段开头的 abi 字（PERF_SAMPLE_REGS_ABI_64 == 2）。
+            // 每段开头的 abi 必须是 PERF_SAMPLE_REGS_ABI_64 == 2；不是就说明
+            // 布局假设不成立，宁可丢弃该组寄存器也不能把它当 PC/寄存器用
+            //（P0-5：错位的样本正是这样产出「addr 与 disasm 对不上」的记录）。
+            constexpr uint64_t kAbi64 = 2;
             const size_t regBytes = (size_t)kRegCount * 8;
-            const size_t userOff  = 24;                 // 用户寄存器数组起点
-            const size_t needUser = userOff + regBytes; // header+TID+abi+regs
+            const size_t userOff  = 24;                 // header+TID+abi 之后
+            const size_t needUser = userOff + regBytes;
             const size_t intrOff  = needUser + 8;       // 跳过 intr 的 abi
             const size_t needIntr = intrOff + regBytes;
             if (hdr.size >= needUser) {
+                static bool loggedLayout = false;
                 uint32_t pid = 0, tid = 0;
                 RingRead(base, ev.data_size, tail + 8, &pid, 4);
                 RingRead(base, ev.data_size, tail + 12, &tid, 4);
-                std::vector<uint64_t> userRegs((size_t)kRegCount);
-                RingRead(base, ev.data_size, tail + userOff, userRegs.data(),
-                         regBytes);
-                std::vector<uint64_t> regs = std::move(userRegs);
-                if (hdr.size >= needIntr) {
-                    std::vector<uint64_t> intrRegs((size_t)kRegCount);
-                    RingRead(base, ev.data_size, tail + intrOff,
-                             intrRegs.data(), regBytes);
-                    // 选择非零项更多的寄存器组（越完整越可信）；
-                    // 打平时沿用 REGS_USER。
-                    auto nonZero = [](const std::vector<uint64_t>& v) {
-                        size_t n = 0;
-                        for (uint64_t x : v) if (x) ++n;
-                        return n;
-                    };
-                    if (nonZero(intrRegs) > nonZero(userRegs))
-                        regs = std::move(intrRegs);
+                if (!loggedLayout) {
+                    // 一次性布局自检：设备上抓 logcat -s ATraceBP 可核对
+                    // REGS 段起点与条数是否与内核 ABI 一致。
+                    loggedLayout = true;
+                    __android_log_print(
+                        ANDROID_LOG_INFO, "ATraceBP",
+                        "sample layout: size=%u regCount=%d userOff=%zu "
+                        "intrOff=%zu (intr %s)",
+                        (unsigned)hdr.size, kRegCount, userOff, intrOff,
+                        hdr.size >= needIntr ? "present" : "absent");
                 }
+
+                std::vector<uint64_t> regs((size_t)kRegCount, 0);
+                size_t userNonZero = 0, intrNonZero = 0;
+                bool gotUser = false;
+
+                uint64_t abiUser = 0;
+                RingRead(base, ev.data_size, tail + userOff - 8, &abiUser, 8);
+                if (abiUser == kAbi64) {
+                    std::vector<uint64_t> userRegs((size_t)kRegCount, 0);
+                    RingRead(base, ev.data_size, tail + userOff,
+                             userRegs.data(), regBytes);
+                    for (uint64_t x : userRegs) if (x) ++userNonZero;
+                    regs = std::move(userRegs);
+                    gotUser = true;
+                } else {
+                    __android_log_print(
+                        ANDROID_LOG_ERROR, "ATraceBP",
+                        "sample REGS_USER abi=%llu != 2：布局不匹配，丢弃该组寄存器",
+                        (unsigned long long)abiUser);
+                }
+
+                if (hdr.size >= needIntr) {
+                    uint64_t abiIntr = 0;
+                    RingRead(base, ev.data_size, tail + intrOff - 8, &abiIntr, 8);
+                    if (abiIntr == kAbi64) {
+                        std::vector<uint64_t> intrRegs((size_t)kRegCount, 0);
+                        RingRead(base, ev.data_size, tail + intrOff,
+                                 intrRegs.data(), regBytes);
+                        for (uint64_t x : intrRegs) if (x) ++intrNonZero;
+                        // 仅当 REGS_USER 不可用或 REGS_INTR 更完整时才替换。
+                        // 执行断点的 pc 语义已在 EmitHit 里按断点地址校准，
+                        // 这里的选择不再影响「pc 是否可信」。
+                        if (!gotUser || intrNonZero > userNonZero)
+                            regs = std::move(intrRegs);
+                    } else {
+                        __android_log_print(
+                            ANDROID_LOG_ERROR, "ATraceBP",
+                            "sample REGS_INTR abi=%llu != 2：布局不匹配，忽略该组",
+                            (unsigned long long)abiIntr);
+                    }
+                }
+
                 EmitHit(ev, tid, regs);
+            } else {
+                __android_log_print(
+                    ANDROID_LOG_ERROR, "ATraceBP",
+                    "sample 记录过短 size=%u < needUser=%zu：无法解析寄存器",
+                    (unsigned)hdr.size, needUser);
             }
         }
         // PERF_RECORD_LOST 等其他记录类型会被跳过。
@@ -610,9 +713,13 @@ static bool HandleStdin() {
         return true;
     }
     if (cmd == "clearall") {
+        // 而 ClearBreakpoint 内部会 erase g_active → 迭代器失效（UB），
+        // 表现为 removed 数量重复计算/偶尔崩溃。先拷贝地址再清。
+        std::vector<uint64_t> addrs;
+        addrs.reserve(g_active.size());
+        for (const ActiveBp& bp : g_active) addrs.push_back(bp.addr);
         int closed = 0;
-        for (const ActiveBp& bp : g_active)
-            closed += ClearBreakpoint(bp.addr);
+        for (uint64_t a : addrs) closed += ClearBreakpoint(a);
         printf("OK clearall removed=%d\n", closed);
         fflush(stdout);
         return true;

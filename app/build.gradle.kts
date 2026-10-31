@@ -14,10 +14,11 @@ android {
 
     defaultConfig {
         applicationId = "com.Alive.Trace"
+        ndkVersion = "30.0.16248370"
         minSdk = 24
         targetSdk = 36
-        versionCode = 1101
-        versionName = "1.1.1"
+        versionCode = 1200
+        versionName = "1.2.0"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         ndk {
@@ -136,7 +137,12 @@ tasks.register("buildInjectorExecutable") {
             }
             """.trimIndent()
         )
-        val srcs = fileTree(srcDir) { include("*.cpp") }.files.map { it.absolutePath }
+        // 排除零 ptrace 注入器：它有独立的 main()，由下面的
+        // zptArgs 单独编译成 assets/zpt，不能混进 ptrace 注入器一起链接。
+        val srcs = fileTree(srcDir) {
+            include("*.cpp")
+            exclude("zeroptrace_injector.cpp")
+        }.files.map { it.absolutePath }
         val commonArgs = listOf(
             "-std=gnu++17", "-D_GNU_SOURCE", "-O2", "-fPIE", "-pie",
             "-static-libstdc++", "-s",
@@ -151,6 +157,28 @@ tasks.register("buildInjectorExecutable") {
                 commandLine("cmd", "/c", clangExe.absolutePath, *commonArgs.toTypedArray())
             } else {
                 commandLine(clangExe.absolutePath, *commonArgs.toTypedArray())
+            }
+        }
+
+        // 零 ptrace 注入器：**单独**编译成 assets/zpt。
+        // 它有自己的 main()，不能和上面的 ptrace 注入器源文件一起编译，必须独立一份。
+        val zptSrc = File(srcDir, "zeroptrace_injector.cpp")
+        if (zptSrc.exists()) {
+            val zptArgs = listOf(
+                "-std=gnu++17", "-D_GNU_SOURCE", "-O2", "-fPIE", "-pie",
+                "-static-libstdc++", "-s",
+                "-I", incDir.absolutePath,
+                "-o", File(outDir, "zpt").absolutePath,
+                zptSrc.absolutePath, "-llog"
+            )
+            @Suppress("DEPRECATION")
+            project.exec {
+                workingDir(projectDir)
+                if (isWindows) {
+                    commandLine("cmd", "/c", clangExe.absolutePath, *zptArgs.toTypedArray())
+                } else {
+                    commandLine(clangExe.absolutePath, *zptArgs.toTypedArray())
+                }
             }
         }
     }

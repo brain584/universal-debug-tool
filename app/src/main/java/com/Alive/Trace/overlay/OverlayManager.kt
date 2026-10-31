@@ -68,6 +68,17 @@ private fun buildRipple(content: android.graphics.drawable.Drawable?,
  */
 class OverlayManager(val act: Activity, private val onExit: () -> Unit) {
 
+    companion object {
+        /** ：全局单例引用，供 MCP 侧（同进程）同步断点悬浮按钮。 */
+        @Volatile
+        var instance: OverlayManager? = null
+    }
+
+    init {
+        instance = this
+    }
+
+
     private val wm get() = act.getSystemService(Activity.WINDOW_SERVICE) as WindowManager
     private val prefs = act.getSharedPreferences("overlay", Activity.MODE_PRIVATE)
     private val dp get() = act.resources.displayMetrics.density
@@ -79,8 +90,7 @@ class OverlayManager(val act: Activity, private val onExit: () -> Unit) {
 
     // 独立悬浮断点控件：每下一个断点就出现一个小按钮，
     // 显示断点 id，点击销毁并清除该断点。
-    private val bpChips = mutableListOf<View>()
-    private var bpChipSeq = 0
+    private val bpChips = LinkedHashMap<Long, TextView>()
 
     var bubbleDp = prefs.getInt("bubble_dp", 52)
     var panelAlpha = prefs.getInt("panel_alpha", 88)  // 0..100
@@ -540,56 +550,90 @@ class OverlayManager(val act: Activity, private val onExit: () -> Unit) {
     }
 
     // ── 独立悬浮断点控件 ────────────────────────────────────────────
-    // 下断后出现一个显示 "断点 <id>" 的小按钮；点击它即销毁该按钮
-    // 并向断点服务下发 clear，停止该断点。
-    fun addBpChip(addr: Long) {
+    // 这里把 BpUi 同步成右上角小按钮。按钮文本 = "0x地址 类型 ×命中数"，
+    // 点击 = 清除该断点（最后一个被清除时顺带停掉断点服务）。
+    fun addBpChip(addr: Long) = addBpChip(addr, "x", 4)
+
+    fun addBpChip(addr: Long, type: String, len: Int) {
         if (addr <= 0) return
-        val id = ++bpChipSeq
-        val chip = TextView(act).apply {
-            text = "断点 $id"
+        BpUi.upsert(addr, type, len)
+        syncBpChips()
+    }
+
+    private fun chipColor(type: String): Int = when (type) {
+        "x" -> 0xEED32F2F.toInt()
+        "w" -> 0xEEEF6C00.toInt()
+        "r" -> 0xEE1565C0.toInt()
+        "rw" -> 0xEE6A1B9A.toInt()
+        else -> 0xEE444444.toInt()
+    }
+
+    private fun chipText(it: BpUi.Item): String =
+        String.format("0x%X %s ×%d", it.addr, it.type, it.hits)
+
+    /** 把 BpUi 的表同步成悬浮按钮（增删改一次完成；主线程执行）。 */
+    fun syncBpChips() {
+        onUi {
+            val want = BpUi.snapshot()
+            val wantAddrs = want.map { it.addr }.toHashSet()
+            for (addr in bpChips.keys.toList()) {
+                if (addr !in wantAddrs) {
+                    bpChips.remove(addr)?.let { runCatching { wm.removeView(it) } }
+                }
+            }
+            for (item in want) {
+                val chip = bpChips[item.addr]
+                if (chip == null) {
+                    val v = makeChip(item)
+                    val lp = WindowManager.LayoutParams(
+                        WindowManager.LayoutParams.WRAP_CONTENT,
+                        WindowManager.LayoutParams.WRAP_CONTENT,
+                        overlayType,
+                        WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL or
+                            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                            WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
+                        PixelFormat.TRANSLUCENT
+                    ).apply { gravity = Gravity.TOP or Gravity.RIGHT }
+                    v.enableRipple()
+                    runCatching {
+                        wm.addView(v, lp)
+                        bpChips[item.addr] = v
+                    }.onFailure { e ->
+                        runCatching { wm.removeView(v) }
+                        toast("断点控件创建失败: ${e.message}")
+                    }
+                } else {
+                    chip.text = chipText(item)
+                    (chip.background as? GradientDrawable)?.setColor(chipColor(item.type))
+                }
+            }
+            layoutBpChips()
+        }
+    }
+
+    private fun makeChip(item: com.Alive.Trace.overlay.BpUi.Item): TextView =
+        TextView(act).apply {
+            text = chipText(item)
             textSize = 12f
             setTextColor(0xFFFFFFFF.toInt())
             setPadding(dp(10), dp(6), dp(10), dp(6))
             background = GradientDrawable().apply {
-                setColor(0xEED32F2F.toInt())
+                setColor(chipColor(item.type))
                 cornerRadius = dp(14).toFloat()
             }
             isClickable = true
             isFocusable = true
             setOnClickListener {
-                runCatching { NativeBridge.bpClear(addr) }
-                runCatching { wm.removeView(this) }
-                bpChips.remove(this)
-                layoutBpChips()
-                // 最后一个断点被关闭时，同步停止断点服务；命中结果保留。
-                if (bpChips.isEmpty()) {
-                    runCatching { NativeBridge.bpStop() }
-                }
+                runCatching { NativeBridge.bpClear(item.addr) }
+                BpUi.clear(item.addr)
                 (pageObjs["断点"] as? BpPage)?.onTick()
+                syncBpChips()
+                if (BpUi.snapshot().isEmpty()) runCatching { NativeBridge.bpStop() }
             }
         }
-        val lp = WindowManager.LayoutParams(
-            WindowManager.LayoutParams.WRAP_CONTENT,
-            WindowManager.LayoutParams.WRAP_CONTENT,
-            overlayType,
-            WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL or
-                WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
-                WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
-            PixelFormat.TRANSLUCENT
-        ).apply { gravity = Gravity.TOP or Gravity.RIGHT }
-        chip.enableRipple()
-        runCatching {
-            wm.addView(chip, lp)
-            bpChips.add(chip)
-            layoutBpChips()
-        }.onFailure { e ->
-            runCatching { wm.removeView(chip) }
-            toast("断点控件创建失败: ${e.message}")
-        }
-    }
 
     private fun layoutBpChips() {
-        bpChips.forEachIndexed { i, v ->
+        bpChips.values.forEachIndexed { i, v ->
             val lp = v.layoutParams as? WindowManager.LayoutParams ?: return@forEachIndexed
             lp.gravity = Gravity.TOP or Gravity.RIGHT
             lp.x = dp(8)
@@ -599,7 +643,8 @@ class OverlayManager(val act: Activity, private val onExit: () -> Unit) {
     }
 
     fun clearBpChips() {
-        for (v in bpChips.toList()) runCatching { wm.removeView(v) }
+        BpUi.clearAll()
+        for (v in bpChips.values.toList()) runCatching { wm.removeView(v) }
         bpChips.clear()
     }
 

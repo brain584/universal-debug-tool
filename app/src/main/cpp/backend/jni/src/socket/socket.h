@@ -50,6 +50,10 @@ private:
     void SetStatus(const std::string& s);
     void SetError(const std::string& e);
 
+    // 保护 ConnectAsync / Disconnect 的生命周期操作：
+    // 多个线程（MCP 客户端线程 / UI 线程 / OneShot）可能同时连/断，
+    // 并发 join 会抛 std::system_error(EINVAL) 直接 abort（tombstone_08 实测）。
+    std::mutex                m_lifecycle_mutex;
     std::thread               m_thread;
     std::atomic<bool>         m_running{false};
     std::atomic<bool>         m_connected{false};
@@ -70,6 +74,7 @@ private:
     int                       m_relay_write = -1;
     int                       m_relay_pid = -1;
     std::string               m_target_pkg;   // 由 m_io_mutex 保护
+
     uint32_t                  m_send_counter = 0;
 
     uint8_t                   m_key[32];

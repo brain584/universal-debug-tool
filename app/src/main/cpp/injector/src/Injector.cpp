@@ -24,6 +24,53 @@
 #define ANDROID_DLEXT_USE_LIBRARY_FD 0x10
 #endif
 
+namespace {
+
+// ─────────────────────────────────────────────────────────────────────────────
+// P0-3：dlopen 成功后的 JNI_OnLoad 可靠性兜底
+//
+// 旧实现只在 `injectedElf.loadFromMemory()` 成功时才调用 callEntryPoint()。
+// loadFromMemory 依赖「能按名字定位到映射 + ELF/dynamic 段可读」：memfd 分支
+// 用 `/memfd:<随机名>` 定位、常规 dlopen 用复制后的路径定位，任一定位失败
+// （result.base == 0）都会让 JNI_OnLoad 被**静默跳过** → agent 的
+// LuaEngine::SetJavaVM 永不执行 → artHook 拿不到 JavaVM。
+//
+// 这里补一层不依赖 ELF 解析的兜底：直接用 dlopen 返回的 handle 远程调用
+// dlsym(handle, name)。g_remoteDlsym 在 init() 里解析一次（与 dlopen/dlclose
+// 同法），失败则惰性重试。
+uintptr_t g_remoteDlsym = 0;
+
+// 最近一次 dlopen/android_dlopen_ext 成功返回的 handle（0 = 无）。
+// 仅用于「ELF 符号表解析失败」时给 AgentStartWithAuth 做 dlsym 兜底，
+// 注入器是单次进程，不存在并发覆盖。
+uintptr_t g_lastInjectedHandle = 0;
+
+uintptr_t RemoteDlsym(RemoteProcess* remote, uintptr_t handle, const char* name) {
+    if (!remote || !handle || !name || !*name) return 0;
+    if (!g_remoteDlsym) {
+        g_remoteDlsym = remote->findRemoteSymbol(
+            "dlsym", reinterpret_cast<uintptr_t>(&dlsym));
+        if (g_remoteDlsym) {
+            LOGI("Remote dlsym: %p", (void*)g_remoteDlsym);
+        } else {
+            LOGE("Cannot resolve remote dlsym（符号兜底不可用，只能走 ELF 符号表）");
+        }
+    }
+    if (!g_remoteDlsym) return 0;
+
+    uintptr_t nameAddr = remote->remoteAllocString(name);
+    if (!nameAddr) {
+        LOGE("dlsym(\"%s\"): remoteAllocString failed", name);
+        return 0;
+    }
+    uintptr_t sym = remote->callFunctionFrom(0, g_remoteDlsym, 2, handle, nameAddr);
+    remote->remoteFree(nameAddr, strlen(name) + 1);
+    if (!sym || sym == static_cast<uintptr_t>(-1)) return 0;
+    return sym;
+}
+
+} // 匿名命名空间
+
 Injector::Injector(pid_t pid) : m_pid(pid) {}
 
 Injector::~Injector() {
@@ -48,6 +95,12 @@ bool Injector::init() {
     
     m_remoteDlclose = m_remote->findRemoteSymbol("dlclose",
         reinterpret_cast<uintptr_t>(&dlclose));
+
+    // P0-3：dlsym 用于 JNI_OnLoad / AgentStartWithAuth 的兜底符号解析。
+    // 解析失败不影响注入主流程，只影响「内存 ELF 解析失败」时的兜底能力。
+    g_remoteDlsym = m_remote->findRemoteSymbol("dlsym",
+        reinterpret_cast<uintptr_t>(&dlsym));
+    LOGI("Remote dlsym: %p", (void*)g_remoteDlsym);
     
     // android_dlopen_ext 可选
     void* dlopenExt = dlsym(RTLD_DEFAULT, "android_dlopen_ext");
@@ -72,34 +125,12 @@ void Injector::cleanupAllocations() {
 InjectionResult Injector::inject(const InjectorConfig& config) {
     InjectionResult result;
 
-    // 清理上一次运行遗留的过期 agent socket / 密钥文件。刚注入的
-    // agent 无法自行删除它们（SELinux 禁止目标应用上下文
-    // 在 /data/local/tmp 上执行 unlink），否则
-    // bind() 会报 "Address already in use" 失败。我们以 root 运行，
-    // 因此可以在这里删除。
+    // 清理上一次运行遗留的过期 agent socket；顺带删除旧版本遗留的
+    // /data/local/tmp 公共密钥文件（旧实现 0666 落盘，属于安全风险）。
+    // 注意：现在**不再创建**任何公共路径的密钥文件；认证材料由调用方
+    // （GUI，App 私有目录）生成，见 startAgentWithAuth()。
     unlink("/data/local/tmp/universal_debug_tool.sock");
     unlink("/data/local/tmp/universal_debug_tool_key.bin");
-
-    // 预先创建共享密钥（即使目标应用的 SELinux 上下文
-    // 无法写入 /data/local/tmp，root 也可以写），
-    // 无论 agent 自身创建文件是否成功，通道都能工作。
-    {
-        uint8_t key[44];
-        int urand = open("/dev/urandom", O_RDONLY);
-        if (urand >= 0) {
-            ssize_t rd = read(urand, key, sizeof(key));
-            close(urand);
-            if (rd == (ssize_t)sizeof(key)) {
-                int kf = open("/data/local/tmp/universal_debug_tool_key.bin",
-                              O_WRONLY | O_CREAT | O_TRUNC, 0666);
-                if (kf >= 0) {
-                    (void)write(kf, key, sizeof(key));
-                    close(kf);
-                    chmod("/data/local/tmp/universal_debug_tool_key.bin", 0666);
-                }
-            }
-        }
-    }
     
     // 检查库文件
     if (!Utils::fileExists(config.libPath)) {
@@ -176,17 +207,52 @@ InjectionResult Injector::inject(const InjectorConfig& config) {
     }
     
     if (result.success) {
-        // 获取加载后的 ELF 信息
-        ElfParser injectedElf;
-        if (injectedElf.loadFromMemory(m_pid, result.base)) {
+        // ── P0-3：dlopen 成功后「必定尝试」调用 JNI_OnLoad ────────────────
+        // 旧实现整段逻辑都嵌在 `if (injectedElf.loadFromMemory(...))` 里：
+        // base 定位失败（memfd 映射名对不上 / 复制路径与 maps 不一致）时，
+        // 入口点与 AgentStartWithAuth 都被静默跳过，表现为「注入成功但
+        // artHook 拿不到 JavaVM / agent 连不上」。现在：
+        //   1) 先用多种方式补定位 base（这里 + injectWithMemfd/Dlopen 内）；
+        //   2) 无论内存 ELF 是否解析成功，都调用 callEntryPoint()；
+        //      它会在 ELF 符号表失败时用 dlsym(handle) 兜底；
+        //   3) 隐藏/混淆仍只在 ELF 解析成功时执行（与旧行为一致，避免拿
+        //      残缺的段信息去 patch soinfo/maps）。
+        uintptr_t base = result.base;
+        if (base == 0) {
+            // 按原文件基名再定位一次（findMapByName 支持 basename 匹配）。
+            MapEntry byName = Utils::findMapByName(m_pid, config.libPath);
+            if (byName.start) {
+                base = byName.start;
+                result.base = base;
+                LOGW("注入返回的 base 为空，按文件基名重新定位到 %p", (void*)base);
+            }
+        }
+        if (base == 0) {
+            LOGE("注入成功但拿不到加载基址（base=0）：内存 ELF 解析不可用，"
+                 "JNI_OnLoad 将只走 dlsym(handle) 兜底");
+        }
 
-            if (config.dlcloseHide) {
-                // dlclose 隐藏流程:
-                // 1. 先调用入口点（dlclose 后 handle 失效）
-                // 2. patch soinfo 使 dlclose 跳过 munmap/析构
-                // 3. dlclose 让 linker 自动清理 solist/soinfo
-                // 4. maps 隐藏 + ELF 混淆照常执行
-                callEntryPoint(result.handle, injectedElf);
+        ElfParser injectedElf;
+        bool elfOk = (base != 0) && injectedElf.loadFromMemory(m_pid, base);
+        if (!elfOk) {
+            LOGE("解析注入库的内存 ELF 失败（base=%p）：JNI_OnLoad / "
+                 "AgentStartWithAuth 将尝试 dlsym(handle, ...) 兜底；"
+                 "两者都失败时 agent 拿不到 JavaVM、socket 也不会监听",
+                 (void*)base);
+        }
+
+        g_lastInjectedHandle = result.handle;   // 供 dlsym 兜底
+
+        if (config.dlcloseHide) {
+            // dlclose 隐藏流程:
+            // 1. 先调用入口点（dlclose 后 handle 失效）
+            // 2. patch soinfo 使 dlclose 跳过 munmap/析构
+            // 3. dlclose 让 linker 自动清理 solist/soinfo
+            // 4. maps 隐藏 + ELF 混淆照常执行
+            callEntryPoint(result.handle, injectedElf);
+            startAgentWithAuth(injectedElf, config);
+
+            if (elfOk) {
                 hideViaDlclose(result.handle, injectedElf);
 
                 if (config.hideMaps) {
@@ -203,7 +269,16 @@ InjectionResult Injector::inject(const InjectorConfig& config) {
                     }
                 }
             } else {
-                // 原始流程: solist 隐藏 → maps 隐藏 → 入口点 → 混淆
+                LOGW("跳过 dlclose/maps/ELF 混淆：内存 ELF 解析失败"
+                     "（避免用残缺段信息做破坏性 patch）");
+            }
+        } else {
+            // P0-3 顺序调整：入口点/认证先做 —— 此时 ELF 头与符号表一定还在，
+            // 不必让 JNI_OnLoad 冒 hideFromMaps（段被替换为匿名映射）的风险。
+            callEntryPoint(result.handle, injectedElf);
+            startAgentWithAuth(injectedElf, config);
+
+            if (elfOk) {
                 if (config.hideSolist) {
                     hideFromSolist(injectedElf);
                 }
@@ -211,8 +286,6 @@ InjectionResult Injector::inject(const InjectorConfig& config) {
                 if (config.hideMaps) {
                     hideFromMaps(injectedElf);
                 }
-
-                callEntryPoint(result.handle, injectedElf);
 
                 if (!obfuscateElfHeader(injectedElf)) {
                     LOGW("ELF header obfuscation failed or skipped");
@@ -224,10 +297,11 @@ InjectionResult Injector::inject(const InjectorConfig& config) {
                         LOGI("Deep ELF obfuscation applied");
                     }
                 }
+            } else {
+                LOGW("跳过 solist/maps/ELF 混淆：内存 ELF 解析失败");
             }
-        } else {
-            LOGW("Failed to parse injected library, skipping entry point call");
         }
+        g_lastInjectedHandle = 0;
     } else {
         // 获取错误信息
         std::string err = getDlerror();
@@ -275,6 +349,11 @@ InjectionResult Injector::injectWithDlopen(const std::string& libPath, int flags
     auto map = Utils::findMapByName(m_pid, libPath);
     if (map.start) {
         result.base = map.start;
+    } else {
+        // P0-3：base=0 会让 inject() 里的内存 ELF 解析失败。此时
+        // JNI_OnLoad 只能靠 dlsym(handle) 兜底，把原因打出来便于定位。
+        LOGE("dlopen 成功但按路径定位不到映射（%s）：result.base=0，"
+             "JNI_OnLoad 将只走 dlsym(handle) 兜底", libPath.c_str());
     }
     
     LOGI("Library loaded at %p, handle: %p", (void*)result.base, (void*)result.handle);
@@ -617,8 +696,20 @@ InjectionResult Injector::injectWithMemfd(const std::string& libPath, int flags)
     auto map = Utils::findMapByName(m_pid, memfdPath);
     if (map.start) {
         result.base = map.start;
+    } else {
+        // P0-3：memfd 在 maps 里的显示名受内核/bionic 版本影响（可能带
+        // " (deleted)" 或只有名字本身），再按随机名匹配一次。
+        auto map2 = Utils::findMapByName(m_pid, memfdName);
+        if (map2.start) {
+            result.base = map2.start;
+            LOGW("memfd 映射名与 \"%s\" 不完全一致，按随机名定位到 %p",
+                 memfdPath.c_str(), (void*)result.base);
+        } else {
+            LOGE("android_dlopen_ext 成功但定位不到 memfd 映射（%s）：result.base=0，"
+                 "JNI_OnLoad 将只走 dlsym(handle) 兜底", memfdPath.c_str());
+        }
     }
-    
+
     LOGI("Library loaded via memfd at %p, handle: %p", (void*)result.base, (void*)result.handle);
     return result;
 }
@@ -634,107 +725,283 @@ std::string Injector::getDlerror() {
     return "";
 }
 
-uintptr_t Injector::getJavaVM() {
-    // 查找 libart.so - 需要找到包含 ELF header 的段
-    auto maps = Utils::parseMaps(m_pid);
-    MapEntry artMap{};
-    
-    // 遍历所有 libart.so 的映射，找到包含有效 ELF header 的
-    for (const auto& map : maps) {
-        if (map.path.find("libart.so") == std::string::npos) continue;
-        if (!map.isReadable()) continue;
-        
-        // 检查是否包含 ELF 魔数
+namespace {
+
+// 在目标进程里定位 JNI_GetCreatedJavaVMs。
+//
+// 旧实现只认 libart.so，且只取第一个「可读 + ELF 魔数」的段；一旦：
+//   · ROM 把该符号放在 libnativehelper.so / 其它 so；
+//   · libart 的 maps 顺序/段权限变化导致取到的不是基址段；
+// 就会直接返回 0 → JNI_OnLoad 不调用。这里按「候选库 → 退化扫描所有
+// file-backed 模块」两级查找，并把命中位置写进 where 供日志定位。
+uintptr_t FindJavaVMsSymbol(RemoteProcess* remote, pid_t pid, std::string* where) {
+    if (!remote) return 0;
+    auto maps = Utils::parseMaps(pid);
+
+    // 只接受「段起始就是 ELF 头」的映射，避免把可执行段当基址解析。
+    auto elfBaseOf = [&](const MapEntry& m) -> uintptr_t {
+        if (m.start == 0 || !m.isReadable()) return 0;
         char magic[4] = {0};
-        if (m_remote->readMemory(map.start, magic, sizeof(magic)) == sizeof(magic)) {
-            if (memcmp(magic, "\x7f" "ELF", 4) == 0) {
-                artMap = map;
-                break;
+        if (remote->readMemory(m.start, magic, sizeof(magic)) != (ssize_t)sizeof(magic))
+            return 0;
+        return memcmp(magic, "\x7f" "ELF", 4) == 0 ? m.start : 0;
+    };
+
+    // 1) 已知候选库（覆盖绝大多数 Android 版本）。
+    const char* kCandidates[] = {"libart.so", "libnativehelper.so", nullptr};
+    for (int i = 0; kCandidates[i]; ++i) {
+        for (const auto& m : maps) {
+            if (m.path.find(kCandidates[i]) == std::string::npos) continue;
+            uintptr_t base = elfBaseOf(m);
+            if (!base) continue;
+            ElfParser elf;
+            if (!elf.loadFromMemory(pid, base)) {
+                LOGE("%s: 解析内存 ELF 失败（base=%p），继续尝试其它候选",
+                     kCandidates[i], (void*)base);
+                continue;
             }
+            uintptr_t sym = elf.findSymbol("JNI_GetCreatedJavaVMs");
+            if (!sym) {
+                LOGE("%s 里没有 JNI_GetCreatedJavaVMs 符号（base=%p）",
+                     kCandidates[i], (void*)base);
+                continue;
+            }
+            if (where)
+                *where = std::string(kCandidates[i]) + " base=" +
+                         Utils::format("%p", (void*)base);
+            return sym;
         }
     }
-    
-    if (artMap.start == 0) {
-        LOGE("Cannot find libart.so with valid ELF header");
-        return 0;
+
+    // 2) 退化：扫描所有带 .so/apex 的可读映射（上限 64 个模块，防止耗时失控）。
+    int scanned = 0;
+    for (const auto& m : maps) {
+        if (scanned >= 64) break;
+        if (m.start == 0 || m.path.empty() || !m.isReadable()) continue;
+        if (m.path.find(".so") == std::string::npos &&
+            m.path.find("/apex/") == std::string::npos)
+            continue;
+        uintptr_t base = elfBaseOf(m);
+        if (!base) continue;
+        ++scanned;
+        ElfParser elf;
+        if (!elf.loadFromMemory(pid, base)) continue;
+        uintptr_t sym = elf.findSymbol("JNI_GetCreatedJavaVMs");
+        if (!sym) continue;
+        LOGW("JNI_GetCreatedJavaVMs 不在候选库里，退化扫描命中: %s base=%p",
+             m.path.c_str(), (void*)base);
+        if (where)
+            *where = m.path + " base=" + Utils::format("%p", (void*)base);
+        return sym;
     }
-    
-    LOGI("Found libart.so at %p (path: %s)", (void*)artMap.start, artMap.path.c_str());
-    
-    // 解析 libart
-    ElfParser artElf;
-    if (!artElf.loadFromMemory(m_pid, artMap.start)) {
-        LOGE("Failed to parse libart.so at %p", (void*)artMap.start);
-        return 0;
-    }
-    
-    LOGI("Parsed libart.so: base=%p, dynstr=%p, dynsym=%p", 
-         (void*)artElf.base(), (void*)artElf.stringTable(), (void*)artElf.symbolTable());
-    
-    // 查找 JNI_GetCreatedJavaVMs
-    uintptr_t getJavaVMs = artElf.findSymbol("JNI_GetCreatedJavaVMs");
+    return 0;
+}
+
+} // 匿名命名空间
+
+uintptr_t Injector::getJavaVM() {
+    std::string where;
+    uintptr_t getJavaVMs = FindJavaVMsSymbol(m_remote.get(), m_pid, &where);
+
+    // 失败分级 1/4：符号解析失败。
     if (!getJavaVMs) {
-        LOGE("Cannot find JNI_GetCreatedJavaVMs");
+        LOGE("getJavaVM 失败[1/4]：目标里找不到 JNI_GetCreatedJavaVMs"
+             "（libart.so / libnativehelper.so / 退化扫描均未命中）");
         return 0;
     }
-    
-    LOGI("JNI_GetCreatedJavaVMs: %p", (void*)getJavaVMs);
-    
-    // 分配缓冲区: JavaVM* + jsize
-    size_t bufSize = sizeof(uintptr_t) + sizeof(int);
+    LOGI("JNI_GetCreatedJavaVMs: %p (%s)", (void*)getJavaVMs, where.c_str());
+
+    // 缓冲区布局：JavaVM* + jsize（与 JNI_GetCreatedJavaVMs 的
+    // (JavaVM** vmBuf, jsize bufLen, jsize* nVMs) 参数对应）。
+    const size_t bufSize = sizeof(uintptr_t) + sizeof(int32_t);
     uintptr_t remoteBuf = m_remote->remoteAlloc(bufSize, PROT_READ | PROT_WRITE);
     if (!remoteBuf) {
+        LOGE("getJavaVM 失败[2/4]：remoteAlloc(%zu) 失败", bufSize);
         return 0;
     }
     m_allocations.push_back({remoteBuf, bufSize});
-    
-    // 调用 JNI_GetCreatedJavaVMs(vmBuf, 1, &nVMs)
-    uintptr_t status = m_remote->callFunctionFrom(0, getJavaVMs, 3,
-        remoteBuf,                          // vmBuf
-        (uintptr_t)1,                       // bufLen
-        remoteBuf + sizeof(uintptr_t)       // nVMs
-    );
-    
-    if (status != 0) {
-        LOGE("JNI_GetCreatedJavaVMs failed: %lu", status);
-        return 0;
+
+    // 预填哨兵：callFunctionFrom() 在「远程调用失败」时也返回 0（与 JNI_OK
+    // 同值），单看返回值无法区分。若调用根本没执行，nVMs 会保持哨兵值。
+    constexpr int32_t kNvmsSentinel = 0x7FFFFFFF;
+    uint8_t initBuf[sizeof(uintptr_t) + sizeof(int32_t)] = {0};
+    memcpy(initBuf + sizeof(uintptr_t), &kNvmsSentinel, sizeof(int32_t));
+    m_remote->writeMemory(remoteBuf, initBuf, bufSize);
+
+    uintptr_t status = 0;
+    for (int attempt = 1; attempt <= 3; ++attempt) {
+        status = m_remote->callFunctionFrom(0, getJavaVMs, 3,
+            remoteBuf,                          // vmBuf
+            (uintptr_t)1,                       // bufLen
+            remoteBuf + sizeof(uintptr_t)       // nVMs
+        );
+
+        uintptr_t jvm = 0;
+        int32_t nVMs = kNvmsSentinel;
+        bool readOk =
+            m_remote->readMemory(remoteBuf, &jvm, sizeof(jvm)) == (ssize_t)sizeof(jvm) &&
+            m_remote->readMemory(remoteBuf + sizeof(uintptr_t), &nVMs, sizeof(nVMs)) ==
+                (ssize_t)sizeof(nVMs);
+
+        if (!readOk) {
+            // 失败分级 3/4：远程调用后读不回缓冲区。
+            LOGE("getJavaVM 失败[3/4]：JNI_GetCreatedJavaVMs 调用后读回远程缓冲区失败"
+                 "（第 %d/3 次）", attempt);
+        } else if (status != 0) {
+            // 失败分级 2/4：JNI 明确返回错误码（非 JNI_OK）。
+            LOGE("getJavaVM 失败[2/4]：JNI_GetCreatedJavaVMs 返回 %ld（非 JNI_OK，"
+                 "应为 0；常见原因：bufLen/参数布局不兼容）（第 %d/3 次）",
+                 (long)status, attempt);
+        } else if (nVMs == kNvmsSentinel) {
+            // 失败分级 4/4：JNI 返回 0 但缓冲区一个字节都没被写 → 远程调用没生效。
+            LOGE("getJavaVM 失败[4/4]：远程调用未生效（nVMs 仍是哨兵值，说明 "
+                 "callFunctionFrom 失败；见日志里 callFunction: 行）（第 %d/3 次）",
+                 attempt);
+        } else if (nVMs <= 0) {
+            LOGE("getJavaVM 失败：JNI_GetCreatedJavaVMs 返回 JNI_OK 但 nVMs=%d"
+                 "（目标进程尚无已创建的 JavaVM）（第 %d/3 次）", (int)nVMs, attempt);
+        } else if (jvm == 0) {
+            LOGE("getJavaVM 失败：JNI_GetCreatedJavaVMs 返回 JNI_OK(nVMs=%d) 但 "
+                 "JavaVM*=NULL（第 %d/3 次）", (int)nVMs, attempt);
+        } else {
+            LOGI("JavaVM: %p (nVMs=%d%s)", (void*)jvm, (int)nVMs,
+                 attempt > 1 ? "，重试后拿到" : "");
+            return jvm;
+        }
+        usleep(50 * 1000);
     }
-    
-    // 读取结果
-    uintptr_t jvm = 0;
-    m_remote->readMemory(remoteBuf, &jvm, sizeof(jvm));
-    
-    LOGI("JavaVM: %p", (void*)jvm);
-    return jvm;
+
+    LOGE("getJavaVM 最终失败：3 次尝试后仍没有有效 JavaVM；"
+         "因此 JNI_OnLoad 无法调用，agent 的 SetJavaVM/artHook 将不可用");
+    return 0;
 }
 
 bool Injector::callEntryPoint(uintptr_t handle, const ElfParser& elf) {
-    // 先检查注入的库是否包含 JNI_OnLoad，若没有则跳过创建 JavaVM（节省开销）
+    // 先查 ELF 符号表；失败（内存 ELF 解析失败 / 符号未进 .dynsym）时
+    // 用 dlopen 的 handle 走远程 dlsym 兜底 —— 只要库里真的导出
+    // JNI_OnLoad，就一定能拿到地址并尝试调用。
     uintptr_t jniOnLoad = elf.findSymbol("JNI_OnLoad");
+    bool viaDlsym = false;
     if (!jniOnLoad) {
-        LOGI("JNI_OnLoad not found in library, skipping entry point call");
-        return true;
+        jniOnLoad = RemoteDlsym(m_remote.get(), handle, "JNI_OnLoad");
+        viaDlsym = jniOnLoad != 0;
+        if (!jniOnLoad) {
+            // 失败分级 A：符号找不到（不是 agent / 被 strip / 解析全失败）。
+            LOGE("JNI_OnLoad 未调用[A]：注入库里找不到该符号"
+                 "（ELF 解析 base=%p 失败，dlsym(handle=%p) 也未命中）。"
+                 "若注入的不是 agent/libagent.so，artHook 将拿不到 JavaVM。",
+                 (void*)elf.base(), (void*)handle);
+            return false;
+        }
+        LOGW("JNI_OnLoad 通过 dlsym(handle) 兜底解析 = %p（ELF 符号表未命中）",
+             (void*)jniOnLoad);
     }
+    LOGI("Calling JNI_OnLoad at %p (via %s)", (void*)jniOnLoad,
+         viaDlsym ? "dlsym" : "elf-symbol");
 
-    // 只有在确实存在 JNI_OnLoad 时才获取 JavaVM
-    (void)handle;
+    // 失败分级 B：拿不到 JavaVM（getJavaVM 内部已按 1/4~4/4 打具体原因）。
     uintptr_t jvm = getJavaVM();
     if (!jvm) {
-        LOGW("Cannot get JavaVM, skipping JNI_OnLoad");
+        LOGE("JNI_OnLoad 未调用[B]：拿不到 JavaVM（原因见上一条 getJavaVM 失败[N/4] 日志）；"
+             "agent 的 LuaEngine::SetJavaVM 不会执行，artHook 将报无 JavaVM");
         return false;
     }
 
-    LOGI("Calling JNI_OnLoad at %p", (void*)jniOnLoad);
+    // 调用 JNI_OnLoad(JavaVM*, reserved)。
+    // JNI 规范里 reserved 必须是 nullptr：旧实现传 1337，agent 只把它用来打
+    // 一行 "injected by universal_debug_tool" 日志（无功能依赖），这里按规范传 0。
+    // 使用默认 caller（返回后跳转到 libc 只读段 → SIGSEGV 捕获函数返回）。
+    uintptr_t ret = m_remote->callFunctionFrom(0, jniOnLoad, 2, jvm, (uintptr_t)0);
 
-    // 调用 JNI_OnLoad(JavaVM*, secretKey)
-    // secretKey = 1337 用于被注入库识别
-    // 使用默认 caller（会触发 SIGSEGV）
-    constexpr uintptr_t SECRET_KEY = 1337;
-
-    uintptr_t ret = m_remote->callFunctionFrom(0, jniOnLoad, 2, jvm, SECRET_KEY);
-    LOGI("JNI_OnLoad returned: 0x%lx", ret);
-
+    // 失败分级 C：远程调用失败/库拒绝初始化。JNI_OnLoad 正常应返回
+    // JNI_VERSION_1_6 = 0x00010006；返回 0 表示不能在当前 VM 使用。
+    if (ret == 0) {
+        LOGE("JNI_OnLoad 调用未成功[C]：返回 0（JNI_ERR/无法确定版本）。"
+             "artHook 仍拿不到 JavaVM；需检查 agent 与 VM 版本是否匹配。");
+        return false;
+    }
+    constexpr uintptr_t kJNI_VERSION_1_6 = 0x00010006;
+    if (ret != kJNI_VERSION_1_6) {
+        LOGW("JNI_OnLoad 返回非常规版本 0x%lx（期望 0x10006）；VM 已交给 agent，"
+             "但请确认 agent 版本", (unsigned long)ret);
+    } else {
+        LOGI("JNI_OnLoad OK：JavaVM=%p 已交给 agent（artHook 可用）", (void*)jvm);
+    }
     return true;
+}
+
+bool Injector::startAgentWithAuth(const ElfParser& elf, const InjectorConfig& config) {
+    // 认证材料：32B key + 12B nonce（由 GUI 生成，存在 App 私有目录），
+    // 加上允许直连的 GUI uid。整块通过远程内存写入目标进程，agent 只在内存持有。
+    uint8_t material[44];
+    if (config.keyFile.empty()) {
+        LOGW("no --key-file given; agent will refuse to listen (channel disabled)");
+        return false;
+    }
+    int kf = open(config.keyFile.c_str(), O_RDONLY | O_CLOEXEC);
+    if (kf < 0) {
+        LOGE("cannot open key file %s: %s", config.keyFile.c_str(), strerror(errno));
+        return false;
+    }
+    size_t got = 0;
+    while (got < sizeof(material)) {
+        ssize_t r = read(kf, material + got, sizeof(material) - got);
+        if (r <= 0) break;
+        got += (size_t)r;
+    }
+    close(kf);
+    if (got != sizeof(material)) {
+        LOGE("key file %s incomplete (%zu/44)", config.keyFile.c_str(), got);
+        return false;
+    }
+
+    uintptr_t fn = elf.findSymbol("AgentStartWithAuth");
+    if (!fn) {
+        // 与 JNI_OnLoad 相同：内存 ELF 解析失败时用 handle 走远程 dlsym，
+        // 避免「注入成功但 socket 永不监听」。
+        fn = RemoteDlsym(m_remote.get(), g_lastInjectedHandle, "AgentStartWithAuth");
+        if (fn) {
+            LOGW("AgentStartWithAuth 通过 dlsym(handle) 兜底解析 = %p", (void*)fn);
+        }
+    }
+    if (!fn) {
+        LOGE("agent has no AgentStartWithAuth symbol (ELF 解析失败且 dlsym 未命中); "
+             "channel disabled —— 注入成功但 socket 不会监听");
+        return false;
+    }
+
+    struct AgentAuthBlob {
+        uint32_t magic;
+        uint32_t version;
+        uint8_t  key[32];
+        uint8_t  nonce[12];
+        uint32_t client_uid;
+    } blob;
+    memset(&blob, 0, sizeof(blob));
+    blob.magic   = 0x43525441u;   // 'ATRC'
+    blob.version = 1;
+    memcpy(blob.key, material, 32);
+    memcpy(blob.nonce, material + 32, 12);
+    blob.client_uid = config.clientUid;
+
+    uintptr_t remote = m_remote->remoteAlloc(sizeof(blob), PROT_READ | PROT_WRITE);
+    if (!remote) {
+        LOGE("failed to allocate remote memory for auth blob");
+        return false;
+    }
+    if (m_remote->writeMemory(remote, &blob, sizeof(blob)) != (ssize_t)sizeof(blob)) {
+        LOGE("failed to write auth blob");
+        m_remote->remoteFree(remote, sizeof(blob));
+        return false;
+    }
+
+    uintptr_t rc = m_remote->callFunctionFrom(0, fn, 1, remote);
+    LOGI("AgentStartWithAuth -> %lu (client_uid=%u)", rc, (unsigned)config.clientUid);
+
+    // 用完立即释放并清零远程副本
+    memset(&blob, 0, sizeof(blob));
+    m_remote->remoteFree(remote, sizeof(blob));
+    return rc == 0;
 }
 
 bool Injector::hideFromMaps(const ElfParser& elf) {

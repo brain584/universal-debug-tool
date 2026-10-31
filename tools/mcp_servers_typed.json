@@ -1,0 +1,14 @@
+{
+  "_说明": "stdio 类型写法（部分客户端要求显式 type）；路径同 mcp_servers.json 说明。",
+  "mcpServers": {
+    "atrace": {
+      "type": "stdio",
+      "command": "python",
+      "args": [
+        "tools/atrace_mcp.py",
+        "--port",
+        "28471"
+      ]
+    }
+  }
+}

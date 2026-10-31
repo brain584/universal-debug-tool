@@ -1,9 +1,10 @@
 // ImGui 侧加密通道客户端。
 //
 // 与 agent 的服务端实现对应：相同的分帧、相同的 ChaCha20
-// 核心、相同的密钥文件、相同的方向 nonce。参见 agent_socket.cpp。
+// 核心、相同的密钥材料（App 私有目录，见 ChannelKey.h）、相同的方向 nonce。
 
 #include "socket/socket.h"
+#include "socket/ChannelKey.h"
 
 #include <android/log.h>
 #include <errno.h>
@@ -20,6 +21,9 @@
 #include <chrono>
 #include <vector>
 
+// 统一的 su 入口（见 SuBridge.h）：本文件里两处 root 调用都改用它。
+#include "SuBridge.h"
+
 #define TAG "SocketClient"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, TAG, __VA_ARGS__)
@@ -27,7 +31,6 @@
 namespace {
 
 constexpr char kSocketPath[] = "/data/local/tmp/universal_debug_tool.sock";
-constexpr char kKeyPath[]    = "/data/local/tmp/universal_debug_tool_key.bin";
 constexpr size_t kKeyLen     = 32;
 constexpr size_t kNonceLen   = 12;
 constexpr size_t kMaxMsg     = 1024 * 1024;  // 1 MiB 负载上限
@@ -187,45 +190,16 @@ SocketClient::~SocketClient() {
     Disconnect();
 }
 
-namespace {
-// 通过 `su -c cat` 读取 44 字节的密钥 + nonce，绕过
-// 可能阻止应用直接读取的 DAC/SELinux 限制。
-bool ReadKeyViaRoot(uint8_t* key, uint8_t* nonce, const char* path) {
-    char cmd[320];
-    snprintf(cmd, sizeof(cmd), "su -c 'cat %s' 2>/dev/null", path);
-    FILE* p = popen(cmd, "r");
-    if (!p) return false;
-    size_t k = fread(key, 1, 32, p);
-    size_t n = fread(nonce, 1, 12, p);
-    pclose(p);
-    return k == 32 && n == 12;
-}
-} // 匿名命名空间
-
 bool SocketClient::LoadKeyFile() {
-    FILE* f = fopen(kKeyPath, "rb");
-    if (!f) {  // 直接读取失败
-        // Root 回退：应用有 su 权限，通过 shell 读取
-        // 即使在 SELinux/DAC 阻止直接打开时也能工作。
-        if (ReadKeyViaRoot(m_key, m_nonce, kKeyPath)) return true;
-        char buf[192];
-        snprintf(buf, sizeof(buf), "无法读取密钥文件 %s: %s",
-                 kKeyPath, strerror(errno));
-        SetError(buf);
-        LOGE("%s", buf);
+    // 而是由 App 在本进程内生成/加载，保存在 **App 私有目录**
+    // （<filesDir>/channel_key.bin，0600）。注入器（root）读取同一文件后
+    // 通过远程内存写进目标进程，agent 只在内存持有。
+    if (!ChannelKey::Ensure(m_key, m_nonce)) {
+        SetError("无法生成/读取通道密钥（App 私有目录不可写？）");
+        LOGE("ChannelKey::Ensure failed (path=%s)", ChannelKey::Path().c_str());
         return false;
     }
-    size_t k = fread(m_key, 1, kKeyLen, f);
-    size_t n = fread(m_nonce, 1, kNonceLen, f);
-    fclose(f);
-    if (k != kKeyLen || n != kNonceLen) {
-        char buf[192];
-        snprintf(buf, sizeof(buf), "密钥文件 %s 内容不完整 (%zu/%zu 字节)",
-                 kKeyPath, k, kKeyLen);
-        SetError(buf);
-        LOGE("%s", buf);
-        return false;
-    }
+    LOGI("channel key loaded from %s", ChannelKey::Path().c_str());
     return true;
 }
 
@@ -239,9 +213,8 @@ int SocketClient::SpawnRelay(int& read_fd, int& write_fd) {
     };
     for (int i = 0; kRelayPaths[i]; ++i) {
         if (access(kRelayPaths[i], X_OK) != 0) continue;
-        char cmd[512];
-        snprintf(cmd, sizeof(cmd), "su -c '%s --relay %s' 2>/dev/null",
-                 kRelayPaths[i], SocketName().c_str());
+        // 与 BpService 同理：下面自己 fork+execl sh -c，所以这里不能再套外层 sh
+        std::string cmd = SuSpawnCommand(std::string(kRelayPaths[i]) + " --relay " + SocketName());
 
         int to_child[2], from_child[2];
         if (pipe(to_child) != 0 || pipe(from_child) != 0) return -1;
@@ -257,7 +230,7 @@ int SocketClient::SpawnRelay(int& read_fd, int& write_fd) {
             dup2(from_child[1], STDOUT_FILENO);
             close(to_child[0]); close(to_child[1]);
             close(from_child[0]); close(from_child[1]);
-            execl("/system/bin/sh", "sh", "-c", cmd, (char*)nullptr);
+            execl("/system/bin/sh", "sh", "-c", cmd.c_str(), (char*)nullptr);
             _exit(127);
         }
         close(to_child[0]);
@@ -447,13 +420,17 @@ void SocketClient::RecvLoop(int fd) {
 }
 
 void SocketClient::ConnectAsync() {
+    std::lock_guard<std::mutex> life(m_lifecycle_mutex);
     if (m_connected.load() || m_connecting.load()) return;
-    if (m_thread.joinable()) m_thread.join();   // 回收上一个工作线程
+    if (m_thread.joinable()) {
+        try { m_thread.join(); } catch (const std::exception&) {}
+    }
     m_running.store(true);
     m_thread = std::thread(&SocketClient::ConnectLoop, this);
 }
 
 void SocketClient::Disconnect() {
+    std::lock_guard<std::mutex> life(m_lifecycle_mutex);
     m_running.store(false);
     {
         std::lock_guard<std::mutex> lk(m_io_mutex);
@@ -466,7 +443,11 @@ void SocketClient::Disconnect() {
         m_relay_read = -1;
         if (m_fd >= 0) shutdown(m_fd, SHUT_RDWR);  // 解除 RecvLoop 阻塞
     }
-    if (m_thread.joinable()) m_thread.join();
+    if (m_thread.joinable()) {
+        // join 抛异常会让 std::thread 析构时终止进程（tombstone_08 实测），
+        // 这里显式吞掉：最坏情况是线程泄漏，但绝不 abort。
+        try { m_thread.join(); } catch (const std::exception&) {}
+    }
 }
 
 void SocketClient::SetTargetPackage(const std::string& pkg) {
@@ -475,9 +456,6 @@ void SocketClient::SetTargetPackage(const std::string& pkg) {
 }
 
 std::string SocketClient::SocketName() const {
-    // 固定名称，与 agent 的抽象 socket 一致。目标进程
-    // 可能是 cmdline 不是包名的 zygote USAP，因此
-    // 名称不能依赖 cmdline。
     return "udt_debug_chan";
 }
 

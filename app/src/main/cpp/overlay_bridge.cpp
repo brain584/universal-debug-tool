@@ -27,6 +27,7 @@ extern std::string RunSuCommand(const std::string& cmd);
 extern std::string RunInjector(const std::string& pkg);
 extern std::string RunInjectorPid(int pid);
 extern std::string RunInjectorArgs(const std::string& args);
+extern std::string RunZeroPtraceInject(int pid, const std::string& pkg_hint);
 extern std::string ReadRemoteMaps(int pid);
 
 // SO 通道：ImGui 侧同一加密 socket 客户端实现（悬浮窗脚本页复用）。
@@ -146,8 +147,48 @@ bool ReadHitValues(int pid, const std::vector<Hit>& hits, int type,
     return true;
 }
 
+// JNI 的 NewStringUTF 要求 **Modified UTF-8**；传入非法字节会直接让 ART
+// abort（"JNI DETECTED ERROR: input is not valid Modified UTF-8"）。
+// 这里统一做消毒：非法/不完整的多字节序列用一个 '?' 替换，保证永不 abort。
+static std::string SanitizeUtf8(const std::string& in) {
+    std::string out;
+    out.reserve(in.size());
+    size_t i = 0;
+    while (i < in.size()) {
+        unsigned char c = (unsigned char)in[i];
+        size_t n = 0;
+        if (c < 0x80) n = 1;
+        else if ((c & 0xE0) == 0xC0) n = 2;
+        else if ((c & 0xF0) == 0xE0) n = 3;
+        else if ((c & 0xF8) == 0xF0) n = 4;
+        bool ok = (n > 0) && (i + n <= in.size());
+        // Modified UTF-8（JNI 要求的）不支持 4 字节序列（emoji 等），
+        // 会被 CheckJNI 判为非法 → 整段替换成一个 '?'，避免 abort。
+        if (ok && n == 4) {
+            out.push_back('?');
+            i += 4;
+            continue;
+        }
+        if (ok && n > 1) {
+            for (size_t k = 1; k < n; ++k) {
+                if (((unsigned char)in[i + k] & 0xC0) != 0x80) { ok = false; break; }
+            }
+        }
+        // 排除 0x00（NewStringUTF 遇到内嵌 NUL 会被截断）
+        if (ok && n == 1 && c == 0x00) ok = false;
+        if (ok) {
+            out.append(in, i, n);
+            i += n;
+        } else {
+            out.push_back('?');
+            i += 1;
+        }
+    }
+    return out;
+}
+
 jstring ToJString(JNIEnv* env, const std::string& s) {
-    return env->NewStringUTF(s.c_str());
+    return env->NewStringUTF(SanitizeUtf8(s).c_str());
 }
 
 // 按类型把当前值 cur 与目标值 target 做"相等"判定。
@@ -267,6 +308,33 @@ JNIEXPORT jstring JNICALL
 Java_com_Alive_Trace_overlay_NativeBridge_injectPid(JNIEnv* env, jobject,
                                                     jint pid) {
     return ToJString(env, RunInjectorPid(pid));
+}
+
+// extraArgs 由 Kotlin 侧按 -m/-H/-S/-C/-D/-n 拼好，直接追加给注入器。
+JNIEXPORT jstring JNICALL
+Java_com_Alive_Trace_overlay_NativeBridge_injectPidArgs(JNIEnv* env, jobject,
+                                                        jint pid, jstring extra) {
+    const char* a = extra ? env->GetStringUTFChars(extra, nullptr) : "";
+    std::string args = "-i " + std::to_string((int)pid);
+    if (a && *a) { args += " "; args += a; }
+    if (a) env->ReleaseStringUTFChars(extra, a);
+    return ToJString(env, RunInjectorArgs(args));
+}
+
+// 零 ptrace 注入（data-only GOT 劫持）：不建立 ptrace 关系。
+JNIEXPORT jstring JNICALL
+Java_com_Alive_Trace_overlay_NativeBridge_injectPkgZero(JNIEnv* env, jobject,
+                                                        jstring pkg) {
+    const char* p = pkg ? env->GetStringUTFChars(pkg, nullptr) : "";
+    std::string ps = p ? p : "";
+    if (p) env->ReleaseStringUTFChars(pkg, p);
+    return ToJString(env, RunZeroPtraceInject(-1, ps));
+}
+
+JNIEXPORT jstring JNICALL
+Java_com_Alive_Trace_overlay_NativeBridge_injectPidZero(JNIEnv* env, jobject,
+                                                        jint pid) {
+    return ToJString(env, RunZeroPtraceInject((int)pid, ""));
 }
 
 JNIEXPORT jstring JNICALL
@@ -1051,7 +1119,40 @@ Java_com_Alive_Trace_overlay_NativeBridge_bpClearHits(JNIEnv*, jobject) {
     g_bp.ClearHits();
 }
 
-// 最近命中："PC|TID|ADDR|反汇编" 行。
+// 清除全部断点（服务端 clearall 命令）。
+JNIEXPORT void JNICALL
+Java_com_Alive_Trace_overlay_NativeBridge_bpClearAll(JNIEnv*, jobject) {
+    g_bp.Send("clearall");
+}
+
+// 最近一条 OK/ERR/INFO 响应（断点服务的确认行，供 MCP/电脑端判断命令是否生效）。
+JNIEXPORT jstring JNICALL
+Java_com_Alive_Trace_overlay_NativeBridge_bpLastLine(JNIEnv* env, jobject) {
+    try {
+        return ToJString(env, g_bp.LastLine());
+    } catch (...) {
+        return ToJString(env, "");
+    }
+}
+
+// 断点服务当前绑定的目标 pid（未运行为 0）。
+JNIEXPORT jint JNICALL
+Java_com_Alive_Trace_overlay_NativeBridge_bpTargetPid(JNIEnv*, jobject) {
+    try {
+        return (jint)g_bp.TargetPid();
+    } catch (...) {
+        return 0;
+    }
+}
+
+// 最近命中记录。每行固定 12 段，以 '|' 分隔（BpPage.kt / MCP bp_hits 依赖，
+// 不要改顺序/段数）：
+//   pc|tid|addr|disasm|sp|stack|regs|counter|region|module|bpt|blen
+// 字段语义（P0-5 统一后）：
+//   pc   = 真实命中指令地址（执行断点 = 断点地址；读写监视点 = 访问指令地址）
+//   addr = 断点地址（下断时给的地址，perf_event_attr.bp_addr）
+//   disasm 基于 pc 处的真实内存反汇编（不是 addr —— 读写监视点的 addr
+//          是数据地址，用 addr 反汇编必然得到"假指令"）。
 JNIEXPORT jstring JNICALL
 Java_com_Alive_Trace_overlay_NativeBridge_bpHits(JNIEnv* env, jobject,
                                                  jint maxN) {
@@ -1080,25 +1181,46 @@ Java_com_Alive_Trace_overlay_NativeBridge_bpHits(JNIEnv* env, jobject,
                          (unsigned long long)it->regs[k].value);
                 regs += rb;
             }
-            // 解析 PC 所属内存区域与模块（供 UI 显示 "Xa libxxx.so"）。
+            // 区域/模块以「命中指令地址」为准；pc 缺失（旧 agent/采样异常）时
+            // 退回断点地址，至少能显示下断位置所属的模块。
+            const uint64_t lookup = it->pc ? it->pc : it->addr;
             std::string region, module;
             for (const auto& r : regions) {
-                if (it->pc >= r.start && it->pc < r.end) {
+                if (lookup >= r.start && lookup < r.end) {
                     region = ShortMemType(r.type);
                     module = ModuleBaseName(r.path);
                     break;
                 }
             }
+            std::string lr_mod, lr_off;
+            {
+                uint64_t lr_val = 0;
+                for (const auto& rg : it->regs)
+                    if (rg.name == "lr") { lr_val = rg.value; break; }
+                if (lr_val) {
+                    for (const auto& r : regions) {
+                        if (lr_val >= r.start && lr_val < r.end) {
+                            lr_mod = ModuleBaseName(r.path);
+                            char ob[24];
+                            snprintf(ob, sizeof(ob), "0x%llx",
+                                     (unsigned long long)(lr_val - r.start));
+                            lr_off = ob;
+                            break;
+                        }
+                    }
+                }
+            }
             char line[4096];
             snprintf(line, sizeof(line),
-                     "%llx|%d|%llx|%s|%llx|%s|%s|%d|%s|%s|%d|%d",
+                     "%llx|%d|%llx|%s|%llx|%s|%s|%d|%s|%s|%d|%d|%s|%s",
                      (unsigned long long)it->pc, it->tid,
                      (unsigned long long)it->addr,
                      it->disasm.c_str(),
                      (unsigned long long)it->sp,
                      stack.c_str(), regs.c_str(),
                      it->counter, region.c_str(), module.c_str(),
-                     it->bp_type, it->bp_len);
+                     it->bp_type, it->bp_len,
+                     lr_mod.c_str(), lr_off.c_str());
             out += line;
             out += '\n';
         }
@@ -1109,11 +1231,45 @@ Java_com_Alive_Trace_overlay_NativeBridge_bpHits(JNIEnv* env, jobject,
     }
 }
 
+// 返回 agent 的 "java_stack <tid> <max>" 原始响应：一行一帧
+// className|method|file|line|native；失败时返回 "ERR ..."
+//（例如该 tid 是纯 native 线程，未被 ART Attach）。
+JNIEXPORT jstring JNICALL
+Java_com_Alive_Trace_overlay_NativeBridge_bpJavaStack(JNIEnv* env, jobject,
+                                                      jint tid, jint maxDepth) {
+    try {
+        int md = (int)maxDepth;
+        if (md <= 0 || md > 128) md = 24;
+        std::string cmd = "java_stack " + std::to_string((int)tid) + " " + std::to_string(md);
+        std::string r = g_ov_socket.SendCommand(cmd, 3000);
+        return ToJString(env, r);
+    } catch (const std::exception& ex) {
+        OLOG("bpJavaStack exception: %s", ex.what());
+        return ToJString(env, "");
+    }
+}
+
 // agent 的 lua 日志（分配等脚本通过 print 回传结果）。
 JNIEXPORT jstring JNICALL
 Java_com_Alive_Trace_overlay_NativeBridge_socketLuaLogs(JNIEnv* env, jobject) {
     return ToJString(env, g_ov_socket.SendCommand("lua_logs 0", 2000));
 }
+
+// agent 自身信息：返回 "agent pid=<N> socket=@<name>"。
+// App 重启后 OState 可能丢失，但 agent 永远知道自己在哪个进程里，
+// 所以电脑端/MCP 用它来确定目标 pid（断点等工具需要）。
+JNIEXPORT jstring JNICALL
+Java_com_Alive_Trace_overlay_NativeBridge_socketAgentInfo(JNIEnv* env, jobject) {
+    return ToJString(env, g_ov_socket.SendCommand("info", 2000));
+}
+
+// agent 运行状态摘要（pid/pkg/base/hooks/hits/uptime），供 MCP 与 UI 显示。
+JNIEXPORT jstring JNICALL
+Java_com_Alive_Trace_overlay_NativeBridge_socketAgentStatus(JNIEnv* env, jobject) {
+    return ToJString(env, g_ov_socket.SendCommand("status", 3000));
+}
+
+
 
 // 目标进程内 mmap（agent 侧 alloc 命令），返回 "ALLOC 0x..." 或错误。
 JNIEXPORT jstring JNICALL
@@ -1154,13 +1310,43 @@ Java_com_Alive_Trace_overlay_NativeBridge_memDisasm(JNIEnv* env, jobject,
     return ToJString(env, DisasmFirstLineArm64(buf.data(), buf.size()));
 }
 
+// 批量反汇编：同一段字节一次性交给 capstone（每行 "addr|bytes|text"）。
+// MCP mem_page 用它做"一次读取 + 一次反汇编"，避免逐行远程读的开销。
+JNIEXPORT jstring JNICALL
+Java_com_Alive_Trace_overlay_NativeBridge_memDisasmBlock(JNIEnv* env, jobject,
+                                                         jlong base, jbyteArray bytes) {
+    if (!bytes) return ToJString(env, "");
+    jsize n = env->GetArrayLength(bytes);
+    if (n < 4) return ToJString(env, "");
+    std::vector<uint8_t> buf((size_t)n);
+    env->GetByteArrayRegion(bytes, 0, n, reinterpret_cast<jbyte*>(buf.data()));
+
+    std::vector<udt_disasm::Insn> insns;
+    if (!udt_disasm::Disassemble(udt_disasm::Arch::Arm64, buf.data(), buf.size(),
+                                 (uint64_t)base, (size_t)n / 4, insns)) {
+        return ToJString(env, "");
+    }
+    std::string out;
+    char line[512];
+    for (const auto& it : insns) {
+        std::string text = it.mnemonic;
+        if (!it.op_str.empty()) { text += ' '; text += it.op_str; }
+        snprintf(line, sizeof(line), "%llx|%s|%s\n",
+                 (unsigned long long)it.addr,
+                 udt_disasm::BytesToHex(it.bytes, it.size).c_str(),
+                 text.c_str());
+        out += line;
+    }
+    return ToJString(env, out);
+}
+
 // 内存页整页读取（复用 ImGui MemLoadCont 的逐行逻辑）：
 // 每行输出 "addr|ok|hex8|disasm|type"。
 JNIEXPORT jstring JNICALL
 Java_com_Alive_Trace_overlay_NativeBridge_memPage(JNIEnv* env, jobject,
                                                   jint pid, jlong base,
                                                   jint rows) {
-    if (rows <= 0 || rows > 64) return ToJString(env, "");
+    if (rows <= 0 || rows > 256) return ToJString(env, "");
     auto regions = ParseMemRegions(pid);
     std::string out;
     for (int i = 0; i < rows; ++i) {
@@ -1182,6 +1368,21 @@ Java_com_Alive_Trace_overlay_NativeBridge_memPage(JNIEnv* env, jobject,
                  ok ? (unsigned int)(b[0] | (b[1] << 8) |
                          (b[2] << 16) | ((uint32_t)b[3] << 24)) : 0u,
                  disasm.c_str(), type.c_str());
+        out += line;
+    }
+    return ToJString(env, out);
+}
+
+// cd/ca/java/xa 这类区域类型（旧版 memPage 每行带的第 5 段）。
+JNIEXPORT jstring JNICALL
+Java_com_Alive_Trace_overlay_NativeBridge_memRegions(JNIEnv* env, jobject, jint pid) {
+    auto regions = ParseMemRegions(pid);
+    std::string out;
+    char line[256];
+    for (const auto& r : regions) {
+        snprintf(line, sizeof(line), "%llx|%llx|%s|%s\n",
+                 (unsigned long long)r.start, (unsigned long long)r.end,
+                 r.type.c_str(), r.path.c_str());
         out += line;
     }
     return ToJString(env, out);

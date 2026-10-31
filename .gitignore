@@ -1,4 +1,4 @@
-*.iml
+﻿*.iml
 .gradle
 .kotlin/
 /local.properties
@@ -14,3 +14,12 @@
 *.jks
 *.keystore
 _unused/
+
+# 自用/非项目内容，不入版本库
+HANDOFF.md
+fixp3.ps1.txt
+# tools/ 运行时生成
+tools/__pycache__/
+tools/pc_config.ini
+tools/script_backups/
+*.pyc

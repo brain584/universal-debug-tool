@@ -21,11 +21,14 @@
 #define TAG "BpService"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, TAG, __VA_ARGS__)
+#define LOGW(...) __android_log_print(ANDROID_LOG_WARN, TAG, __VA_ARGS__)
 
 // 由 native-lib.cpp（同一共享库）提供：解压出的注入器
 // 可执行文件路径。
 extern std::string GetInjectorPath();
 extern bool ReadRemoteBytes(int pid, uintptr_t addr, void* buf, size_t n);
+// 统一的 su 入口（见 SuBridge.h）：断点服务同样要在 root 下起 injector。
+#include "SuBridge.h"
 
 namespace {
 
@@ -67,6 +70,9 @@ static bool ParseHitLine(const std::string& line, BpHit& hit) {
         } else if (key == "blen") {
             hit.bp_len = atoi(tok.c_str() + eq + 1);
         } else if (key == "pc") {
+            // P0-5：HIT 行首的 `pc=` 是「真实命中指令地址」元数据；寄存器
+            // dump 里的 pc 是同一值的重复（旧 agent 会再打一遍）。只认第一次
+            // 出现，避免寄存器 pc 覆盖元数据（历史上最容易被误读成命中地址）。
             if (!ParseHex64(tok.substr(eq + 1), v)) continue;
             if (!seen_pc) {
                 hit.pc = v;
@@ -104,6 +110,19 @@ static bool ParseHitLine(const std::string& line, BpHit& hit) {
             r.value = v;
             hit.regs.push_back(std::move(r));
         }
+    }
+    // 字段语义（P0-5 统一后）：
+    //   addr = 断点地址（下断时给的地址，perf_event_attr.bp_addr）
+    //   pc   = 真实命中指令地址（执行断点 = addr；读写监视点 = 访问指令地址）
+    //   反汇编一律基于 pc，绝不能用 addr。
+    // 旧版 injector 的样本里 PC 可能为 0（部分内核采样缺失）：执行断点
+    // （bpt==4）用断点地址兜底，否则 BpService 会因 pc==0 跳过反汇编，
+    // UI 里只剩下一个无法定位指令的 addr。读写监视点不能这样兜底 ——
+    // addr 是数据地址，不是指令地址。
+    if (hit.pc == 0 && hit.addr != 0 && hit.bp_type == 4) {
+        hit.pc = hit.addr;
+        LOGW("HIT pc=0，按执行断点语义用 addr=0x%llx 兜底",
+             (unsigned long long)hit.addr);
     }
     return hit.addr != 0 || !hit.regs.empty();
 }
@@ -145,9 +164,15 @@ bool BpService::Spawn(int pid) {
         return false;
     }
 
-    char cmd[512];
-    snprintf(cmd, sizeof(cmd), "su -c '%s --bp %d' 2>/dev/null",
-             inj.c_str(), pid);
+    // 命令形式与**原始实现逐字一致**（用户指出的先前实现）：
+    //     su -c '<injector> --bp <pid>' 2>/dev/null
+    // 注意用 SuSpawnCommand 而不是 SuWrap：
+    //   SuWrap 内部会再套 `/system/bin/sh -c`，而这里下面自己已经
+    //   `execl("/system/bin/sh","-c",...)`，两层一叠变成 sh→sh→su→sh，
+    //   引号被吃、`--bp` 被当成命令名 → 子进程秒退 → 断点显示"未启动"。
+    // ⚠️ 也不能合并 stderr：本服务与子进程之间是走 stdout 的文本协议。
+    std::string cmd = SuSpawnCommand(std::string(inj) + " --bp " + std::to_string(pid) +
+                                     " --parent " + std::to_string(getpid()));
 
     int to_child[2], from_child[2];
     if (pipe(to_child) != 0 || pipe(from_child) != 0) return false;
@@ -163,7 +188,7 @@ bool BpService::Spawn(int pid) {
         dup2(from_child[1], STDOUT_FILENO);
         close(to_child[0]); close(to_child[1]);
         close(from_child[0]); close(from_child[1]);
-        execl("/system/bin/sh", "sh", "-c", cmd, (char*)nullptr);
+        execl("/system/bin/sh", "sh", "-c", cmd.c_str(), (char*)nullptr);
         _exit(127);
     }
 
@@ -255,7 +280,11 @@ void BpService::ReadLoop() {
             if (line.rfind("HIT ", 0) == 0) {
                 BpHit hit;
                 if (ParseHitLine(line, hit)) {
-                    // 尽力而为：反汇编 pc 处的指令（ARM64）。
+                    // 反汇编**始终以 hit.pc 为基准**（真实命中指令地址；
+                    // 执行断点 = 断点地址，读写监视点 = 访问指令地址）。
+                    // 绝不能用 hit.addr：读写监视点的 addr 是数据地址，
+                    // 用数据地址反汇编就会得到"ldr w8,[x8]"这类假指令
+                    //（P0-5 现象：addr 处实际是 cmp，而 disasm 却是另一条）。
                     // 在互斥锁外执行：远程读取耗时，
                     // 不能阻塞渲染线程上的 Hits()/Status()。
                     int pid = m_pid.load();

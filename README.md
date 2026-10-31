@@ -1,111 +1,229 @@
-# Universal Debug Tool（通用动态调试工具）
+# ATrace（ARM64 Android 动态调试工具）
 
-面向 **ARM64 Android** 的本地动态调试工具：运行期调试（函数插桩、硬件断点、主动调用、内存读写、搜索、修改）不挂起目标进程；注入阶段通过 ptrace 会短暂挂起目标进程，注入完成后恢复。整个工具被打包成一个 Android APK，注入与调试能力依赖设备 root。
+原名 Universal Debug Tool。面向 **ARM64 Android** 的本地动态调试工具：运行期调试（函数插桩、
+硬件断点、主动调用、内存读写/搜索/修改）不挂起目标进程；注入阶段通过 ptrace 会短暂挂起目标
+进程，注入完成后恢复。整个工具打包为一个 Android APK，注入与调试能力依赖设备 root。
+
+当前版本：**1.2.0**（versionCode 1200）。版本改动见 [Releases/RELEASE-1.2.0.md](Releases/RELEASE-1.2.0.md)。
+
+## 命名说明（与 Android 系统工具无关）
+
+本项目的名字 **ATrace** 与 Android 平台自带的 `atrace`（Systrace/Perfetto 使用的系统追踪命令）
+**只是重名，两者没有任何代码、功能或依赖关系**。本项目是独立实现的 APK 调试工具，
+不封装、不替代、也不依赖系统 atrace；README 中所有「ATrace」均指本仓库的 App。
+
+## ZeroPtrace 注入（实验性）
+
+「零 ptrace 注入」是**实验特性**：通过 data-only GOT 劫持在目标进程内完成加载，不建立 ptrace 关系
+（`TracerPid` 不变），用于对抗 ptrace 检测的少数场景。**它仅在极少数软件上可正常注入**，
+多数目标会注入失败、进程异常或功能不可用，属于可选实验通道，不建议作为默认用法；
+常规场景请使用默认 ptrace 注入（`inject_pid` / `launch_and_inject`，`zero=false`）。
 
 ## 功能概览
 
-- **进程管理**：root 下按 PID / 包名枚举进程，支持刷新列表。
-- **动态注入**：基于 ptrace 将 agent.so（集成 LuaJIT 与 Dobby）注入目标进程；注入器负责 ELF 解析、远程内存分配、dlopen 等。
-- **加密通信**：GUI 与 agent 之间通过本地 Unix socket 通信，负载使用 ChaCha20 加密，双向独立密钥流。
+- **进程管理**：root 下按 PID / 包名枚举进程、按 PID 直接注入、按包名注入（目标未运行可自动拉起）。
+- **动态注入**：基于 ptrace 把 agent.so（LuaJIT + Dobby + LSPlant）注入目标进程；注入器负责
+  ELF 解析、远程内存分配、dlopen；支持 stealth（memfd / 隐藏 maps / 隐藏 solist / dlclose 隐藏）。
+- **加密通信**：GUI 与 agent 通过抽象 Unix socket 通信，ChaCha20 加密；直连失败时通过 root relay 转发。
+- **MCP 服务**：App 内置 HTTP MCP 服务（默认 `127.0.0.1:28471`），把注入、内存、断点、Lua、
+  模块查询等能力提供给 AI 客户端；工具列表由服务端动态返回，随版本同步。
 - **内存查看与修改**
-  - 解析 `/proc/<pid>/maps` 与 `/proc/<pid>/mem`，按 GG 风格对内存页分类（code app、code system、anonymous、java heap、cpp heap、stack、ashmem 等）。
-  - 连续 / 分页两种浏览模式，支持内存类型多选筛选、数值类型切换（dword、float、utf8、utf16、hex 等）。
-  - 单条内存修改、偏移跳转、地址保存页、链接库基址跳转。
-  - 内存搜索：精确搜索、模糊搜索、改善搜索结果，内存类型可多选（精确 / 范围搜索基于 MemorySearch 引擎，多线程扫描）。
+  - 按 GG 风格整页浏览：一页 0x2000（2048 行）连续滚动、右侧滚动条、页首/页尾「地址跳转」行；
+  - 每行显示地址、hex、ASCII、DWORD、FLOAT、指令与区域类型（code app / java / cd / ca / A 等）；
+  - 长按行：解引用 / 跳转到此地址 / 下断点 / 偏移量计算器 / 指针搜索 / 搜索附近 / 自定义勾选 /
+    复制地址 / 复制值；支持指令引用跳转（adrp/adr/b/bl/ldr 字面量）；
+  - 类型切换（D/F/E/W/B/Q/A/U）、QQ 指针字面量写入（如 `78fd6604Ch`）、`~A8` 汇编写入；
+  - 修改可撤销（Undo），不可读页安全降级显示 0；分配内存页（优先 agent 内 mmap，地址校验）。
+- **内存搜索**：精确 / 范围 / 模糊搜索与结果「改善」，内存类型多选筛选；结果可翻页、批量保存。
 - **动态调试**
-  - LuaJIT 脚本引擎（FFI）：`hookfunc` inline hook、`hookCPU` 寄存器级插桩、`call` 主动调用、内存读写辅助。
-  - 硬件断点（root）：对目标进程所有线程下断，命中后回传寄存器、PC 与堆栈，地址可点击跳转内存页。
-  - 反汇编（capstone）与汇编写入（asmjit）：内存页内可直接修改指令，例如输入 `~A8 nop`、`~A8 cset w0, ne`。
-- **原生悬浮窗 GUI**：基于 Android View 的可拖动气泡 + 全屏面板（选项 / 搜索 / 保存 / 内存 / 断点 / 脚本六个 Tab），支持拖动、Tab 切换、深色模式显示；不依赖 ImGui 渲染。
+  - LuaJIT（FFI）：`hookfunc` / `hookCPU` / `call` / 数值读写 / ArtHook 反射 / `nativeBacktrace` 等；
+    `api()` 可自检可用函数、分组与说明；
+  - 硬件断点（root，perf_event）：对目标全部线程下断，命中回传寄存器、PC、堆栈、模块偏移，
+    并补充 Java 线程调用链；命中计数以悬浮按钮展示，可一键清除；
+  - 反汇编（capstone）与汇编写入（asmjit）。
+- **原生悬浮窗 GUI**：Android View 气泡 + 全屏面板（选项 / 搜索 / 保存 / 内存 / 断点 / 脚本），
+  支持拖动、深浅色、悬浮窗大小与透明度调节；不依赖 ImGui。
+
+## tools/（电脑端辅助脚本）
+
+`tools/` 是**给电脑侧用的辅助脚本**，不参与 APK 构建，核心用途是：
+
+- **MCP 通道**：`tools/atrace_mcp.py` 是电脑端 stdio MCP 服务，把手机 App 暴露的
+  **31 个工具**（注入 / 内存读写搜索 / 硬件断点 / Lua / Java hook / 模块查询等）
+  动态转发给 AI 客户端（Claude Desktop、Cursor 等）；工具清单与实现都由手机端提供，
+  升级 App 即自动同步，不需要改脚本。
+- **电脑写脚本、手机执行**：用 `tools/atrace_lua.py` 或在电脑上让 AI 通过 MCP 调 `run_lua`，
+  脚本实际在手机目标进程内的 LuaJIT 中执行（hook、读写内存、主动调用等）。
+- **手机本地 MCP**：`tools/mcp_local_http.json` / `mcp_local_sse.json` /
+  `mcp_local_streamable.json` 是导入手机 AI App 的配置（App 内 HTTP 服务，端口 28472）。
+
+前置条件：App「选项」页打开「MCP 工具通道」、`adb forward tcp:28471 tcp:28471`、
+目标进程已注入并连接 agent。离线时 `tools/list` 会使用 `tools/mcp_tools_cache.json`
+缓存的工具清单（调用会提示"手机未连接"）。详见 [tools/README.md](tools/README.md)。
+
+## MCP 使用（手机端 / 电脑端）
+
+工具的实际执行都发生在**手机目标进程内**（注入 agent 后由目标进程的 LuaJIT / ART / 内存模块执行）。
+
+- **手机端**：App 选项页打开「MCP 工具通道」→ 手机 AI App 导入
+  `/sdcard/ATrace/mcp_local_http.json`（Streamable HTTP `127.0.0.1:28472/mcp`）
+  或 `mcp_local_sse.json`（旧 SSE `127.0.0.1:28472/sse`）→ 连接后可见 31 个工具。
+- **电脑端**：`tools/atrace_mcp.py` 是 stdio MCP 代理，AI 客户端（Claude Desktop / Cursor）
+  通过它把 `tools/call` 转发到手机 App 的 adb 桥：
+
+  ```json
+  {
+    "mcpServers": {
+      "atrace": {
+        "command": "python",
+        "args": ["tools/atrace_mcp.py", "--port", "28471"]
+      }
+    }
+  }
+  ```
+
+  前置：`adb forward tcp:28471 tcp:28471` + App「MCP 工具通道」已开 + 目标已注入并连接 agent。
+  离线时 `tools/list` 会用 `tools/mcp_tools_cache.json` 缓存列出工具，调用时提示未连接。
+
+**电脑写脚本、手机执行**（三种方式）：
+
+1. AI 客户端里调 `run_lua` 工具（脚本在目标进程 LuaJIT 执行，`print` 随结果返回）；
+2. 运行 `tools\atrace_lua.bat`（电脑 cmd 里编辑/运行 .lua，手机无需开悬浮窗；脚本会自动探测 adb/python 并做 forward）；
+3. App 悬浮窗「脚本」页直接写。
+
+完整说明与 31 个工具清单见 **[docs/MCP.md](docs/MCP.md)**。
+
+## Lua API 示例
+
+首次使用先执行 `api()` / `help()` 查看全部函数签名与说明。常用示例：
+
+```lua
+-- 环境自检
+dump(capabilities(), 1)
+print(artStatus())
+
+-- 模块 / 符号
+local base = module_info("libc.so").base
+print(hexOf(symbol("getpid", "libc.so")))
+
+-- 内存读写
+local p = readPtrNum(base + 0x650d8)
+print(readI32(p))
+writeDword(p, 8888)
+
+-- 原生 hook（观察调用；回调里只做数值运算）
+local h = hookfunc(base + sym_openat, function(regs, a) _G.n = (_G.n or 0) + 1 end)
+print(h:hits()); h:remove()
+
+-- Java hook（拦截检测 / 拿对象）
+artHook("com.example.crc_test.MainActivity$detectRunnable$1", "run", function(ctx)
+  return true
+end)
+```
+
+更多分组示例（模块扫描、hook/回溯、ART、Java 对象、主线程、实战模板）见
+**[docs/LUA-API.md](docs/LUA-API.md)**。
 
 ## 构建
 
-- Android Studio 工程，执行 `assembleDebug` 可一次性构建原生悬浮窗（Kotlin + JNI）、agent.so、注入器并打包为一个 APK。
-- 使用注入、断点、socket relay 等功能需要 root 权限。
+```bash
+# 需要 Android Studio（JBR 17）与 NDK；离线构建示例：
+$env:JAVA_HOME='<Android Studio>/jbr'
+./gradlew assembleDebug --offline
+```
+
+产物：`app/build/outputs/apk/debug/ATrace-debug.apk`（arm64-v8a）。
+
+使用注入、断点、socket relay、内存搜索等功能需要 root。
 
 ## 项目结构
 
-- Kotlin 原生悬浮窗 UI：`app/src/main/java/com/Alive/Trace/overlay`（气泡、面板、各功能页、JNI 桥）。
-- `app/src/main/cpp` 下主要分三部分：
+- 文档：`README.md`、`docs/MCP.md`（两条 MCP 通道与电脑写脚本）、`docs/LUA-API.md`（Lua API 速查与示例）
+- Kotlin 原生悬浮窗 UI：`app/src/main/java/com/Alive/Trace/overlay`
+  （气泡、面板、各功能页、JNI 桥、MCP 服务）
+- `app/src/main/cpp` 分三部分：
 
 | 目录 | 说明 |
 | --- | --- |
-| `backend` | 后端复用层：内存搜索（memorysearch）、断点客户端（BpService）、socket 客户端、反汇编（capstone）、汇编写入（asmjit）；由 `overlay_bridge.cpp` 通过 JNI 暴露给悬浮窗 |
-| `agent` | SO 端：注入目标进程，内置 LuaJIT、Dobby、xDL、socket 服务端与内存工具 |
-| `injector` | 注入器：ptrace 注入、ELF 解析、root 服务（密钥生成、socket relay、断点服务） |
+| `backend` | 后端复用层：内存搜索、断点客户端、socket 客户端、反汇编/汇编写入；由 `overlay_bridge.cpp` 通过 JNI 暴露 |
+| `agent` | SO 端：注入目标进程，内置 LuaJIT、Dobby、LSPlant、xDL、socket 服务端与内存工具 |
+| `injector` | 注入器：ptrace 注入、ELF 解析、root 服务（密钥、socket relay、`--bp` 硬件断点服务、`--alloc` 远程分配） |
 
 ## 技术实现
 
-### Socket 连接方案
+### Socket 连接
 
-- agent 作为 Unix 域 socket 服务端，监听**抽象命名空间**（`sun_path[0] = '\0'`），不落地 socket 文件，从而规避 SELinux 对 `/data/local/tmp` 下 socket 文件的限制。
-- 加密密钥由注入器（root）预先生成到 `/data/local/tmp/universal_debug_tool_key.bin`（32 字节 key + 12 字节 nonce），agent 直接复用，避免注入后因权限不足而无法生成。
-- 消息格式为 4 字节大端长度 + ChaCha20 密文；两个方向使用独立 nonce 与消息计数器，防止重放与串流。
-- GUI 端优先直连 socket；若被 SELinux 拦截，则回退到 root relay：通过 su 启动注入器的 relay 模式，在 stdin/stdout 与 socket 之间转发。
+- agent 监听抽象命名空间 Unix socket（`sun_path[0]='\0'`），不落地文件，规避 SELinux 对
+  `/data/local/tmp` socket 文件的限制。
+- 密钥由注入器（root）预生成到 `/data/local/tmp/universal_debug_tool_key.bin`
+  （32B key + 12B nonce），agent 复用。
+- 消息格式：4 字节大端长度 + ChaCha20 密文，双向独立 nonce/计数器。
+- GUI 优先直连；被 SELinux 拦截时回退 root relay。
+- 固定 socket 名存在「连到旧 agent」风险：客户端连接后校验 agent 返回的 pid，不一致则清理旧宿主进程。
 
-### LuaJIT 交互 Dobby
+### LuaJIT + Dobby + LSPlant
 
-- agent 维护一个持久 LuaJIT 状态（含 FFI），脚本通过加密 socket 以 `lua <script>` 消息执行，输出回传 GUI 日志框。
-- 主要 API：
-  - `getBase`：使用 xDL（`xdl_iterate_phdr`）遍历目标进程已加载的 so，返回基址。
-  - `hookfunc` / `removehook`：封装 DobbyHook，返回跳板地址与成功标志；脚本通过 FFI 将跳板转成函数指针以调用原函数。
-  - `hookCPU`：封装 DobbyInstrument，回调中提供寄存器上下文（lightuserdata）与函数地址。
-  - `call`：把 Lua 闭包排队执行，优先在目标进程主线程（泵为 `eglSwapBuffers` 渲染循环或 `ALooper_pollOnce` 主线程 Looper）；若均不可用，则由独立兜底线程执行（每 20ms 刷新，此时不在目标主线程）。
-  - `read*` / `write*`：内存读写辅助函数。
-- hook 回调与脚本执行共用递归互斥锁，避免回调中再次执行 Lua 造成死锁。
+- agent 维护持久 LuaJIT 状态（含 FFI），脚本经加密 socket 以 `lua <script>` 执行。
+- `hookfunc` / `removehook`：DobbyHook 封装，返回跳板；`hookCPU`：DobbyInstrument 寄存器级插桩；
+  `call`：闭包排队到目标主线程泵（`eglSwapBuffers` / `ALooper_pollOnce`），否则兜底线程执行。
+- ArtHook（LSPlant）：Java 方法 hook、反射调用（findClass / getStatic / setStatic / listMethods）。
+- 回调内禁止分配 Lua 表（会崩溃）：提供 `nativeBacktraceInto` 等安全变体。
 
 ### 内存搜索
 
-- 搜索引擎运行在应用进程内（MemorySearch，MIT）：应用进程非 root，无法直接 open 目标进程 `/proc/<pid>/mem`，因此通过新增的 MemSu 后端（`su` + `dd` 管道）读写目标内存，`maps` 枚举同样走 su，不占用 agent socket 通道。
-- 精确 / 范围搜索已接入该引擎（多线程并行扫描）；模糊搜索与"改善"仍为旧实现。
+- 搜索引擎运行在 App 进程（MemorySearch，MIT）；App 非 root，经 su + dd 管道读写目标内存，
+  maps 枚举同样走 su，不占用 agent socket。
+- 精确/范围搜索接入多线程引擎；模糊搜索与「改善」为旧实现（后续可迁移）。
 
-### 断点实现
+### 硬件断点
 
-- 断点服务以 root 运行（注入器 `--bp` 模式），基于 Linux `perf_event_open` 硬件断点（`PERF_TYPE_BREAKPOINT`），由内核直接编程 CPU 调试寄存器。
-- 周期性重扫目标进程全部线程并统一挂断点，且不设置 sigtrap 位：目标进程不会停顿、不会被 ptrace、也不会收到 SIGTRAP。
-- 命中时通过 `PERF_SAMPLE_REGS_USER` 采集寄存器（跳过 `regs_user_abi` 字段），连同 PC、线程 ID、堆栈链一并回传。
-- 与 GUI 通过管道协议通信（stdin：set / clear / clearall / list / ping / quit；stdout：OK / ERR / INFO / HIT）。GUI 断点页展示寄存器网格、PC 汇编与堆栈链，PC / 寄存器 / 堆栈地址均可点击跳转内存页。
+- 断点服务以 root 运行（`injector --bp <pid> --parent <app pid>`），基于 `perf_event_open`
+  硬件断点，由内核编程调试寄存器；不设 sigtrap，目标不停顿。
+- 命中通过 `PERF_SAMPLE_REGS_USER` 采集寄存器（含 `PERF_SAMPLE_REGS_INTR` 兜底），回传 PC、
+  tid、堆栈、模块偏移；GUI 可点击跳转内存页。
+- `--parent` 看门狗：App 进程退出后断点进程自杀，内核自动释放 perf 事件，避免残留。
+
+### 内存页（GG 风格）
+
+- 整页 0x2000 = 2048 行交给 RecyclerView 虚拟化渲染；一页连续滚动，页首跳转 = 上一页最后一个地址，
+  页尾 = 下一页起始。
+- 读取：优先整页一次 `memRead` + 一次 `memDisasmBlock`（capstone 句柄常驻）；不可读页分块回退；
+  可见区优先反汇编、滚动按需补齐；同页刷新走缓存，重开悬浮窗/切页即时显示。
+- 区域类型来自 `/proc/<pid>/maps`（匿名映射统一显示 `A`）。
 
 ## 已知问题
 
-1. 断点堆栈结果可能不准：目前只做 native 帧回溯（PC + LR），JNI 调用场景无法还原 Java 调用帧，且依赖目标函数的帧指针与寄存器状态，结果仅供参考。
-2. 部分内核/机型上硬件断点采样到的个别寄存器可能为 0（`PERF_SAMPLE_REGS_USER` 的内核行为差异）；代码已追加 `PERF_SAMPLE_REGS_INTR` 兜底，仍以真机表现为准。
-3. Android 10+ 会对后台应用的剪贴板读写做限制：默认直接写剪贴板，若 ROM 禁止，可在「选项」页开启「兼容复制」。
-
-## 可优化方向
-
-- 模糊搜索与"改善"仍为旧实现（单块 su 读取 + 单线程扫描），尚未接入 MemorySearch 引擎。
+1. 断点堆栈以 native 帧（PC + LR）为主，JNI 场景的 Java 帧依赖 `bpJavaStack` 补取，结果仅供参考。
+2. 部分内核/机型上 `PERF_SAMPLE_REGS_USER` 采样的个别寄存器可能为 0（已加 REGS_INTR 兜底）。
+3. Android 10+ 后台窗口写剪贴板可能被拒：可在「选项」页开启「兼容复制」。
+4. Android 16 对匿名可执行内存（execmem）有限制，rwx 分配可能随机失败，工具会降级为 rw 并提示。
+5. 注入/断点/Lua 等能力仅在作者机型（Android 16，arm64）充分验证，其他机型兼容性不保证。
 
 ## 参考库与改动说明
 
 | 库 | 用途 | 改动情况 | 许可证 |
 | --- | --- | --- | --- |
-| [asmjit](https://github.com/asmjit/asmjit) | AArch64 汇编文本写入 | 未改源码，仅新增封装层（Disasm/AsmWrite.h）；CMake 只编译 core/support/arm 子集 | Zlib |
-| [capstone](https://github.com/capstone-engine/capstone) | 反汇编 | 未改源码 | BSD-3-Clause |
+| [asmjit](https://github.com/asmjit/asmjit) | AArch64 汇编文本写入 | 未改源码，仅新增封装层；CMake 只编译 core/support/arm 子集 | Zlib |
+| [capstone](https://github.com/capstone-engine/capstone) | 反汇编 | 未改源码（句柄常驻复用） | BSD-3-Clause |
 | [xDL](https://github.com/hexhacking/xDL) | so 遍历、基址解析 | 未改源码 | MIT |
 | [LuaJIT](https://github.com/LuaJIT/LuaJIT) | 脚本引擎 | 未改源码 | MIT |
-| [Dobby](https://github.com/jmpews/Dobby) | inline hook | 未改源码，使用预编译 `libdobby.a`，经 LuaEngine 薄封装 | Apache-2.0 |
+| [Dobby](https://github.com/jmpews/Dobby) | inline hook | 未改源码，预编译 `libdobby.a`，LuaEngine 薄封装 | Apache-2.0 |
+| [LSPlant](https://github.com/LSPosed/LSPlant) | Java 方法 hook | 未改源码，预编译静态库 | LGPL-3.0 |
 | [AndroidInject](https://github.com/niqiuqiux/AndroidInject) | ptrace 注入器基础 | 未改源码 | 上游未确认，详见上游仓库 |
-| [MemorySearch](https://github.com/Aboy-g/MemorySearch) | 内存读写 / 搜索 | 剔除 Keystone 依赖（write_assembly，避免引入 GPL）；新增 su 后端适配器 MemSu；maps 读取改为 su 管道；源码位于 `backend/jni/memsearch` | MIT |
+| [MemorySearch](https://github.com/Aboy-g/MemorySearch) | 内存读写 / 搜索 | 剔除 Keystone 依赖；新增 su 后端适配器；源码位于 `backend/jni/memsearch` | MIT |
 
 ## 开源协议
 
-本项目自身代码以 Apache License 2.0 发布（见 [LICENSE](LICENSE)），项目内集成的第三方开源库保留其原有许可证，详见上文"参考库与改动说明"。
+本项目自身代码以 Apache License 2.0 发布（见 [LICENSE](LICENSE)），集成的第三方库保留其原有许可证。
 
 ## 致谢
 
-感谢以下开源项目及其作者：asmjit、capstone、xDL、LuaJIT、Dobby、AndroidInject、MemorySearch。
+感谢 asmjit、capstone、xDL、LuaJIT、Dobby、LSPlant、AndroidInject、MemorySearch 等开源项目及其作者。
 
-特别感谢 AlguiMemTool.h 的作者 **ByteCat**（MIT License）：本项目内存分类规则（MemToolTypes.h）基于该库提取，使用过程中保留了原始版权声明与注释。
-
-特别感谢 MemorySearch 的作者 **Aboy-g**（MIT License）：本项目内存搜索引擎基于该库，已剔除其 Keystone 依赖并保留原始 LICENSE。
-
-特别感谢 Codex（OpenAI）在本项目开发过程中协助编写代码。
 
 ## 免责声明
 
-1. 内存分类定义 `MemToolTypes.h` 提取自 AlguiMemTool.h（作者 ByteCat，MIT License）；为尊重作者意愿，提取时保留了原始版权声明与作者信息。
-2. 本工具仅限用于合法用途（如学习研究、对自己拥有权限的程序进行调试等），禁止用于任何非法活动；使用者需自行承担使用本工具产生的全部法律责任。
-3. 本人不一定会对该项目进行维护，如有需求者，请自行下载源码修改并编译。
-4. 本工具仅在作者本人的机型（Android 16）上验证通过，不保证在不同 Android 版本、不同机型上的兼容程度。
-5. 本 README 由 AI 对项目进行分析后编写并优化，不保证内容与实际实现完全一致，可能存在描述不准确或过度夸大之处。
+1. 本工具仅限合法用途（学习研究、调试自己拥有权限的程序等），禁止用于非法活动，使用者自行承担法律责任。
+2. 作者不承诺持续维护；需求请自行 fork 修改编译。
+3. 仅在作者机型（Android 16，arm64）验证通过，不保证其他 Android 版本/机型兼容。
+4. 本 README 由 AI 协助整理，可能与实际实现存在差异。

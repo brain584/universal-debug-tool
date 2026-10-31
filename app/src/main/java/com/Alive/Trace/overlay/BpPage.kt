@@ -67,6 +67,35 @@ class BpPage(private val m: OverlayManager) : OverlayPage {
             }.start()
         }, LinearLayout.LayoutParams(0,
             ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply { marginEnd = dpc(ctx, 6) })
+        // 再用 150ms 存活检查判成败；命令形式一旦被多套 shell 就会"秒退且报错被吞"。
+        // 这个按钮用 App 内真实方式跑一遍，直接告诉你哪种形式可用。
+        ctl.addView(bn("启动自检") {
+            m.toast("自检中…")
+            Thread {
+                val r = runCatching { NativeBridge.spawnDiag() }
+                    .getOrDefault("自检失败（native 调用异常）")
+                m.onUi {
+                    val body = LinearLayout(ctx).apply { orientation = LinearLayout.VERTICAL }
+                    val tv = TextView(ctx).apply {
+                        text = r
+                        textSize = 12f
+                        setTextColor(if (r.contains("✓")) 0xFF1B8C3C.toInt()
+                                      else 0xFFD32F2F.toInt())
+                        setTextIsSelectable(true)
+                        typeface = Typeface.MONOSPACE
+                    }
+                    val sv = ScrollView(ctx).apply {
+                        addView(tv, ViewGroup.LayoutParams(
+                            ViewGroup.LayoutParams.MATCH_PARENT,
+                            ViewGroup.LayoutParams.WRAP_CONTENT))
+                    }
+                    body.addView(sv, LinearLayout.LayoutParams(
+                        ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
+                    m.dialog("断点服务启动自检", body, listOf(Triple("关闭", true) {}))
+                }
+            }.start()
+        }, LinearLayout.LayoutParams(0,
+            ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply { marginEnd = dpc(ctx, 6) })
         ctl.addView(bn("停止服务") {
             Thread {
                 runCatching { NativeBridge.bpStop() }
@@ -87,30 +116,37 @@ class BpPage(private val m: OverlayManager) : OverlayPage {
             gravity = Gravity.CENTER_VERTICAL
             setPadding(0, dpc(ctx, 8), 0, 0)
         }
+        // 统一的输入框样式：圆角浅灰底 + 细边框，和 darkSpinner 保持一致
+        fun fieldBg() = android.graphics.drawable.GradientDrawable().apply {
+            setColor(0xFFF0F0F0.toInt())
+            cornerRadius = dpc(ctx, 6).toFloat()
+            setStroke(dpc(ctx, 1), 0xFFDDDDDD.toInt())
+        }
+        val fieldH = dpc(ctx, 44)
         addrInput = ClipboardEditText(ctx).apply {
             hint = "地址 (hex)"
             textSize = 14f
             isSingleLine = true
             setTextColor(0xFF222222.toInt())
             setHintTextColor(0xFF999999.toInt())
-            background = android.graphics.drawable.GradientDrawable().apply {
-                setColor(0xFFF0F0F0.toInt())
-                cornerRadius = dpc(ctx, 6).toFloat()
-            }
-            setPadding(dpc(ctx, 10), dpc(ctx, 8), dpc(ctx, 10), dpc(ctx, 8))
+            background = fieldBg()
+            setPadding(dpc(ctx, 10), 0, dpc(ctx, 10), 0)
+            gravity = Gravity.CENTER_VERTICAL
         }
-        addrInput.layoutParams = LinearLayout.LayoutParams(0,
-            ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+        addrInput.layoutParams = LinearLayout.LayoutParams(0, fieldH, 1f)
         addrRow.addView(addrInput)
+        // 类型/长度：与输入框同高、同圆角；宽度按"最短可读"分配（之前 132/92dp 太大像灰块）
         val typeSpin = darkSpinner(ctx,
-            listOf("执行 x", "读 r", "写 w", "读写 rw"))
-        addrRow.addView(typeSpin, LinearLayout.LayoutParams(
-            dpc(ctx, 96), ViewGroup.LayoutParams.WRAP_CONTENT))
-        val lenSpin = darkSpinner(ctx, listOf("1", "2", "4", "8")).apply {
+            listOf("x 执行", "r 读", "w 写", "rw 读写"))
+        typeSpin.layoutParams = LinearLayout.LayoutParams(
+            dpc(ctx, 108), fieldH).apply { marginStart = dpc(ctx, 6) }
+        addrRow.addView(typeSpin)
+        val lenSpin = darkSpinner(ctx, listOf("1 字节", "2 字节", "4 字节", "8 字节")).apply {
             setSelection(2)
         }
-        addrRow.addView(lenSpin, LinearLayout.LayoutParams(
-            dpc(ctx, 60), ViewGroup.LayoutParams.WRAP_CONTENT))
+        lenSpin.layoutParams = LinearLayout.LayoutParams(
+            dpc(ctx, 84), fieldH).apply { marginStart = dpc(ctx, 6) }
+        addrRow.addView(lenSpin)
         col.addView(addrRow)
 
         col.addView(bn("添加断点") {
@@ -120,10 +156,10 @@ class BpPage(private val m: OverlayManager) : OverlayPage {
             val len = when (lenSpin.selectedItemPosition) {
                 0 -> 1; 1 -> 2; 3 -> 8; else -> 4
             }
-            runCatching {
-                NativeBridge.bpSet(a, types[typeSpin.selectedItemPosition], len)
-            }
-            m.addBpChip(a)
+            val type = types[typeSpin.selectedItemPosition]
+            BpUi.onTargetChanged(OState.pid)
+            runCatching { NativeBridge.bpSet(a, type, len) }
+            m.addBpChip(a, type, len)
             m.toast("已下发断点，可用右上角悬浮按钮关闭")
         }, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT,
             ViewGroup.LayoutParams.WRAP_CONTENT).apply { topMargin = dpc(ctx, 6) })
@@ -142,11 +178,12 @@ class BpPage(private val m: OverlayManager) : OverlayPage {
             background = android.graphics.drawable.GradientDrawable().apply {
                 setColor(0xFFF0F0F0.toInt())
                 cornerRadius = dpc(ctx, 6).toFloat()
+                setStroke(dpc(ctx, 1), 0xFFDDDDDD.toInt())
             }
-            setPadding(dpc(ctx, 10), dpc(ctx, 8), dpc(ctx, 10), dpc(ctx, 8))
+            setPadding(dpc(ctx, 10), 0, dpc(ctx, 10), 0)
+            gravity = Gravity.CENTER_VERTICAL
         }
-        clrInput.layoutParams = LinearLayout.LayoutParams(0,
-            ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+        clrInput.layoutParams = LinearLayout.LayoutParams(0, dpc(ctx, 44), 1f)
         clr.addView(clrInput)
         clr.addView(bn("清除") {
             val a = MT.parseHex(clrInput.text.toString())
@@ -175,6 +212,7 @@ class BpPage(private val m: OverlayManager) : OverlayPage {
             LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
 
         refresh()
+        m.syncBpChips()
         startWatch()
         return col
     }
@@ -413,6 +451,16 @@ class BpPage(private val m: OverlayManager) : OverlayPage {
                     lastHits = hits
                     renderHits(hits)
                 }
+                // P1-2：命中数写回 BpUi，悬浮按钮显示 "0x地址 类型 ×命中数"
+                val cnt = HashMap<Long, Int>()
+                for (line in hits.split('\n')) {
+                    val h = parseHit(line) ?: continue
+                    cnt[h.addr] = (cnt[h.addr] ?: 0) + 1
+                }
+                for (it in BpUi.snapshot()) {
+                    it.hits = cnt[it.addr] ?: it.hits
+                }
+                if (running) m.syncBpChips()
                 applyStatus(running, st)
             }
         }.start()

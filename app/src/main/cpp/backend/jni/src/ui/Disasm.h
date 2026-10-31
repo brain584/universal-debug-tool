@@ -4,6 +4,7 @@
 // （绝不经过 agent socket），因此繁忙的 Lua 脚本 / hook
 // 不会拖慢反汇编器，反之亦然。
 
+#include <mutex>
 #include <capstone/capstone.h>
 
 #include <cstdint>
@@ -46,20 +47,25 @@ inline bool Disassemble(Arch arch, const uint8_t* code, size_t size,
     out.clear();
     if (!code || size == 0 || maxInsns == 0) return false;
 
+    // 16 块反汇编 = 16 次初始化，这是"汇编半天不出来"的主因）。
+    static std::mutex g_mtx;
+    static csh g_a64 = 0;
+    static csh g_arm = 0;
+    std::lock_guard<std::mutex> lk(g_mtx);
     csh handle = 0;
-    cs_arch a = CS_ARCH_AARCH64;
-    cs_mode m = CS_MODE_LITTLE_ENDIAN;
     if (arch == Arch::Arm) {
-        a = CS_ARCH_ARM;
-        m = CS_MODE_ARM;
+        if (g_arm == 0 &&
+            cs_open(CS_ARCH_ARM, CS_MODE_ARM, &g_arm) != CS_ERR_OK) return false;
+        handle = g_arm;
+    } else {
+        if (g_a64 == 0 &&
+            cs_open(CS_ARCH_AARCH64, CS_MODE_LITTLE_ENDIAN, &g_a64) != CS_ERR_OK)
+            return false;
+        handle = g_a64;
     }
-    if (cs_open(a, m, &handle) != CS_ERR_OK) return false;
 
     cs_insn* insn = cs_malloc(handle);
-    if (!insn) {
-        cs_close(&handle);
-        return false;
-    }
+    if (!insn) return false;
 
     const uint8_t* p = code;
     size_t remaining = size;
@@ -79,7 +85,6 @@ inline bool Disassemble(Arch arch, const uint8_t* code, size_t size,
     }
 
     cs_free(insn, 1);
-    cs_close(&handle);
     return ok;
 }
 

@@ -19,6 +19,7 @@
 #include <sys/mman.h>
 #include <sys/un.h>
 #include <android/log.h>
+#include <thread>
 
 // 中继模式：以 root 连接 Unix socket 并透明转发
 // socket 与 stdin/stdout 之间的字节。imgui 应用通过 `su` 启动它，
@@ -114,6 +115,8 @@ void printUsage(const char* prog) {
     printf("  -t, --timeout <ms>   Watch timeout (milliseconds)\n");
     printf("  -n, --no-copy        Don't copy lib to private dir (use original path)\n");
     printf("  -r, --relay <path>   Relay a unix socket to stdin/stdout (root)\n");
+    printf("      --key-file <p>   Channel key file (44 bytes: 32B key + 12B nonce)\n");
+    printf("      --client-uid <u> GUI uid allowed to connect directly (relay uses root)\n");
     printf("  -B, --bp <pid>       Hardware breakpoint/watchpoint service (root)\n");
     printf("  -h, --help           Show this help\n");
 }
@@ -137,9 +140,12 @@ int main(int argc, char* argv[]) {
     unsigned int delay = 0;
     int timeout = -1;
     std::string relayPath;
+    std::string channelKeyFile;
+    uint32_t    clientUid = 0;
     std::string protStr;
     unsigned long long allocSize = 0;
     pid_t bpPid = 0;
+    pid_t parentPid = 0;
     
     // 解析命令行
     static struct option longOpts[] = {
@@ -156,7 +162,10 @@ int main(int argc, char* argv[]) {
         {"timeout",     required_argument, nullptr, 't'},
         {"no-copy",     no_argument,       nullptr, 'n'},
         {"relay",       required_argument, nullptr, 'r'},
+        {"key-file",    required_argument, nullptr, 1001},
+        {"client-uid",  required_argument, nullptr, 1002},
         {"bp",          required_argument, nullptr, 'B'},
+        {"parent",      required_argument, nullptr, 1003},
         {"alloc",        required_argument, nullptr, 'A'},
         {"prot",         required_argument, nullptr, 'P'},
         {"help",        no_argument,       nullptr, 'h'},
@@ -179,7 +188,10 @@ int main(int argc, char* argv[]) {
             case 't': timeout = atoi(optarg); break;
             case 'n': copyToPrivate = false; break;
             case 'r': relayPath = optarg; break;
+        case 1001: channelKeyFile = optarg; break;
+        case 1002: clientUid = (uint32_t)strtoul(optarg, nullptr, 10); break;
             case 'B': bpPid = atoi(optarg); break;
+            case 1003: parentPid = atoi(optarg); break;
             case 'A': allocSize = strtoull(optarg, nullptr, 0); break;
             case 'P': protStr = optarg; break;
             case 'h':
@@ -194,6 +206,16 @@ int main(int argc, char* argv[]) {
     // 验证参数
     // 断点服务模式不需要注入参数。
     if (bpPid > 0) {
+        // 不会再出现"App 重装/被杀后断点进程/断点残留"。
+        if (parentPid > 0) {
+            std::thread([parentPid]() {
+                for (;;) {
+                    if (kill(parentPid, 0) != 0) _exit(0);
+                    if (getppid() == 1) _exit(0);
+                    usleep(300 * 1000);
+                }
+            }).detach();
+        }
         return RunBreakpointService(bpPid);
     }
 
@@ -304,6 +326,8 @@ int main(int argc, char* argv[]) {
     config.hideMaps = hideMaps;
     config.hideSolist = hideSolist;
     config.dlcloseHide = dlcloseHide;
+    config.keyFile = channelKeyFile;
+    config.clientUid = clientUid;
     config.deepObfuscate = deepObfuscate;
     config.dlFlags = RTLD_NOW;
     config.copyToPrivate = copyToPrivate;

@@ -1,0 +1,13 @@
+{
+  "_说明": "在仓库根目录运行 MCP 客户端时可用；也可把 args 里的路径换成 atrace_mcp.py 的绝对路径。",
+  "mcpServers": {
+    "atrace": {
+      "command": "python",
+      "args": [
+        "tools/atrace_mcp.py",
+        "--port",
+        "28471"
+      ]
+    }
+  }
+}

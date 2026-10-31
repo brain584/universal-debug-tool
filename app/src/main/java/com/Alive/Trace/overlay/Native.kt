@@ -12,12 +12,40 @@ object NativeBridge {
     external fun scanProcesses(): String
     external fun injectPkg(pkg: String): String
     external fun injectPid(pid: Int): String
+    /**
+     * extraArgs 直接拼给注入器，例如 " -m -H -C"（memfd / hide-maps / dlclose-hide）。
+     * 支持开关：-m memfd、-H hide-maps、-S hide-solist、-C dlclose-hide、
+     *            -D deep-obfuscate、-n no-copy。
+     */
+    external fun injectPidArgs(pid: Int, extraArgs: String): String
+    // 零 ptrace 注入：data-only GOT 劫持，不建立 ptrace 关系（实验）
+    external fun injectPkgZero(pkg: String): String
+    external fun injectPidZero(pid: Int): String
+    /**
+     *
+     * 两条注入路径（ptrace 与零 ptrace）都以 `su` 为前置，而 su 能否在 App 进程里
+     * 提到权取决于 ROM/KernelSU 的挂载与授权状态。此前失败时只有一句
+     * "无法启动 su"，看不出真因。这个接口把逐候选路径的实测结果与
+     * 「能否真的拿到 uid=0」一起返回，供 UI 直接展示。
+     */
+    external fun suDiag(): String
+    /** 手动指定 su 路径（特殊 ROM 兜底）；传空串恢复自动解析。 */
+    external fun setSuPath(path: String)
+    /**
+     *
+     * 断点服务是 `fork + execl("sh","-c",cmd)` 起 `su -c '... --bp <pid>'`，
+     * 再用 150ms 存活检查判断成功与否。命令形式一旦被多套一层 shell，
+     * 就会出现"子进程秒退 → 界面显示未启动"且**报错被 2>/dev/null 吞掉**。
+     * 这个接口用 App 内真实方式复现两种形式，直接给出哪种可用。
+     */
+    external fun spawnDiag(): String
     external fun killProcess(pid: Int): String
     external fun procAlive(pid: Int): Boolean
     external fun suCmd(cmd: String): String
     external fun memRead(pid: Int, addr: Long, len: Int): ByteArray?
     external fun memFirstAddress(pid: Int): Long
     external fun memPage(pid: Int, addr: Long, rows: Int): String
+    external fun memRegions(pid: Int): String
     external fun memWrite(pid: Int, addr: Long, data: ByteArray): Boolean
     external fun searchCount(): Int
     external fun searchStatus(): String
@@ -38,6 +66,9 @@ object NativeBridge {
     external fun socketModules(): String
     external fun allocRemote(pid: Int, size: Long, prot: String): String
     external fun memDisasm(bytes: ByteArray): String
+
+    /** 批量反汇编：返回每行 "addr|bytes|text"。 */
+    external fun memDisasmBlock(base: Long, bytes: ByteArray): String
     external fun asmWrite(pid: Int, addr: Long, text: String): String
     external fun bpStart(pid: Int)
     external fun bpStop()
@@ -46,8 +77,27 @@ object NativeBridge {
     external fun bpSet(addr: Long, type: String, len: Int)
     external fun bpClear(addr: Long)
     external fun bpClearHits()
+    /** 清除全部断点（服务端 clearall）。 */
+    external fun bpClearAll()
     external fun bpHits(maxN: Int): String
+    /**
+     * （硬件断点命中行里有 tid；Android 上 tid == Thread.getId()）。
+     * 返回一行一帧 "className|method|file|line|native"；失败返回 "ERR ..."。
+     */
+    external fun bpJavaStack(tid: Int, maxDepth: Int): String
+    /** 断点服务最近一条 OK/ERR/INFO 响应（用于确认 set/clear 是否生效）。 */
+    external fun bpLastLine(): String
+    /** 断点服务当前绑定的目标 pid（未运行返回 0）。 */
+    external fun bpTargetPid(): Int
     external fun socketLuaLogs(): String
+    /** agent 自身信息："agent pid=<N> socket=@<name>"（App 重启后用于确定目标 pid）。 */
+    external fun socketAgentInfo(): String
+    /** agent 运行状态摘要（pid/pkg/base/hooks/hits/uptime）。 */
+    external fun socketAgentStatus(): String
+
+    /** 以 root 执行一条 shell（仅内部用于清理孤儿进程/诊断）。 */
+    external fun runSuShell(cmd: String): String
+
 }
 
 /** 数值类型常量（与 cpp/MemToolTypes.h 一致）。 */
@@ -75,6 +125,22 @@ object MT {
     fun name(t: Int) = when (t) {
         BYTE -> "BYTE"; WORD -> "WORD"; DWORD -> "DWORD"; QWORD -> "QWORD"
         FLOAT -> "FLOAT"; ASCII -> "ASCII"; UTF16 -> "UTF-16LE"; else -> "DOUBLE"
+    }
+
+    /**
+     * 原来 UI 只显示一个字母（D/F/Q/W/B/E/A/U），用户看不出 E 是 Double、
+     * A 是 ASCII，且 ASM 与 Double 都落到 else 分支显示成两个 E。
+     */
+    fun describe(t: Int) = when (t) {
+        BYTE -> "B: Byte (-128 ~ 127)"
+        WORD -> "W: Word (-32,768 ~ 32,767)"
+        DWORD -> "D: Dword (-2,147,483,648 ~ 2,147,483,647)"
+        QWORD -> "Q: Qword (-9,223,372,036,854,775,808 ~ 9,223,372,036,854,775,807)"
+        FLOAT -> "F: Float (±3.4e38，7 位有效数字)"
+        DOUBLE -> "E: Double (±1.8e308，15 位有效数字)"
+        ASCII -> "A: ASCII 字符串（变长）"
+        UTF16 -> "U: UTF-16LE 字符串（变长）"
+        else -> "?: 未知类型"
     }
 
     /** 搜索类型选择顺序（D/F 常用在前）。 */
@@ -202,6 +268,8 @@ class SavedRow(val addr: Long, var type: Int, var label: String,
 
 /** 悬浮窗各页共享状态。 */
 object OState {
+    // 注入方式：true = 零 ptrace（data-only），false = 传统 ptrace 注入器
+    var zeroPtrace: Boolean = false
     @Volatile var pid = 0
     @Volatile var pname = "-"
     @Volatile var pkg = ""
@@ -218,8 +286,64 @@ object OState {
  * 按「注入后自动连接 socket」自动建连。
  */
 object SocketUtil {
+    /**
+     * 旧 agent 里安装的 Dobby hook 跳板会指向旧 Lua 状态；重注入后一旦目标调用
+     * 这些函数就可能 SIGSEGV。这里先尽力卸载一遍（连得上才做），并记录数量。
+     *
+     * 返回给 UI/日志的一句话说明。
+     */
+    /**
+     * 注入/换目标之前清理旧 agent。
+     *
+     * （卸 hook → 关 Lua → 停监听），新 agent 才能 bind 同名 socket；
+     * 拿不到 pid 时退化为对当前连接执行 remove_all_hook。
+     */
+    fun cleanupHooksBeforeInject(reason: String): String {
+        if (!runCatching { NativeBridge.socketIsConnected() }.getOrDefault(false)) {
+            return "未连接旧 agent，跳过 hook 清理"
+        }
+        val before = runCatching { NativeBridge.socketAgentStatus() }.getOrDefault("")
+        val hooksBefore = Regex("hooks=(\\d+)").find(before)?.groupValues?.get(1) ?: "?"
+        runCatching { NativeBridge.socketSendLua("remove_all_hook()") }
+        runCatching { Thread.sleep(250) }
+        return "注入前清理完成（$reason，清理前 hooks=$hooksBefore）"
+    }
+
     private const val PREF = "overlay"
     private const val KEY_AUTO_CONNECT = "inject_autoconnect"
+
+    /**
+     * 「零 ptrace 注入」开关的持久化。
+     *
+     * 写进配置，用户勾一次就记住了 —— 不用每次注入都重新点开对话框去勾。
+     * 与「注入后自动连接 socket」同一份 SharedPreferences。
+     */
+    private const val KEY_ZERO_PTRACE = "inject_zeroptrace"
+
+    fun isZeroPtrace(ctx: Context): Boolean = runCatching {
+        ctx.getSharedPreferences(PREF, Context.MODE_PRIVATE)
+            .getBoolean(KEY_ZERO_PTRACE, false)
+    }.getOrDefault(false)
+
+    fun setZeroPtrace(ctx: Context, on: Boolean) {
+        runCatching {
+            ctx.getSharedPreferences(PREF, Context.MODE_PRIVATE)
+                .edit().putBoolean(KEY_ZERO_PTRACE, on).apply()
+        }
+    }
+
+    /** ：stealth 注入开关（memfd + hide-maps + dlclose-hide），与 MCP 的 stealth=true 对齐。 */
+    fun isStealthInject(ctx: Context): Boolean = runCatching {
+        ctx.getSharedPreferences(PREF, Context.MODE_PRIVATE)
+            .getBoolean("inject_stealth", false)
+    }.getOrDefault(false)
+
+    fun setStealthInject(ctx: Context, on: Boolean) {
+        runCatching {
+            ctx.getSharedPreferences(PREF, Context.MODE_PRIVATE)
+                .edit().putBoolean("inject_stealth", on).apply()
+        }
+    }
 
     /** 最近一次成功注入的目标包名（注入后自动连接时用它做通道目标）。 */
     @Volatile var lastInjectedPkg = ""
@@ -242,9 +366,27 @@ object SocketUtil {
     fun statusText(): String =
         runCatching { NativeBridge.socketStatus() }.getOrDefault("未连接")
 
-    /** 建连前登记目标包名（失败不影响连接：socket 名是固定的）。 */
+    /** 建连前登记目标包名（失败不影响连接：socket 名固定）。 */
     fun prepareTarget(pkg: String) {
         runCatching { NativeBridge.socketSetTarget(pkg) }
+    }
+
+    /**
+     * 连到上一个目标进程里的旧 agent）。不是的话：杀掉旧宿主进程 + 断开连接。
+     * @return true=正常（或无法判断），false=发现并清理了旧 agent
+     */
+    fun verifyAgentPid(expected: Int): Boolean {
+        if (expected <= 0) return true
+        if (!isConnected()) return true
+        val info = runCatching { NativeBridge.socketAgentInfo() }.getOrNull().orEmpty()
+        val apid = Regex("pid=(\\d+)").find(info)?.groupValues?.getOrNull(1)
+            ?.toIntOrNull() ?: return true
+        if (apid == expected) return true
+        android.util.Log.w("ATraceSock",
+            "stale agent pid=$apid expected=$expected info=$info -> kill stale")
+        runCatching { NativeBridge.runSuShell("kill -9 $apid") }
+        runCatching { NativeBridge.socketDisconnect() }
+        return false
     }
 
     /**
@@ -259,6 +401,10 @@ object SocketUtil {
             for (i in 0 until 30) {
                 Thread.sleep(100)
                 if (isConnected()) {
+                    if (!verifyAgentPid(OState.pid)) {
+                        toast(ctx, "检测到旧 agent（pid 不匹配），已杀掉旧进程并断开；请重新注入目标")
+                        return@Thread
+                    }
                     toast(ctx, "SO 通道已自动连接")
                     return@Thread
                 }
